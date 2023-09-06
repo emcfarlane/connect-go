@@ -642,6 +642,60 @@ func TestContextError(t *testing.T) {
 	assert.False(t, connect.IsWireError(err))
 }
 
+func TestContextCancelPropagation(t *testing.T) {
+	t.Parallel()
+	wait := make(chan struct{})
+	pingServer := &pluggablePingServer{
+		countUp: func(ctx context.Context, req *connect.Request[pingv1.CountUpRequest], rsp *connect.ServerStream[pingv1.CountUpResponse]) error {
+			for i := 0; i < int(req.Msg.Number); i++ {
+				select {
+				case <-ctx.Done():
+					t.Log(ctx.Err())
+					return nil
+				case <-wait:
+				}
+				if err := rsp.Send(&pingv1.CountUpResponse{Number: int64(i)}); err != nil {
+					break
+				}
+			}
+			t.Error("should not reach here")
+			return nil
+		},
+	}
+	mux := http.NewServeMux()
+	mux.Handle(pingv1connect.NewPingServiceHandler(pingServer))
+	server := httptest.NewUnstartedServer(mux)
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	client := pingv1connect.NewPingServiceClient(
+		server.Client(),
+		server.URL,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.CountUp(ctx, connect.NewRequest(
+		&pingv1.CountUpRequest{Number: 10},
+	))
+	assert.Nil(t, err)
+	wait <- struct{}{}
+	assert.True(t, stream.Receive())
+	assert.Equal(t, stream.Msg().Number, int64(0))
+
+	cancel() // abort the stream
+	for stream.Receive() {
+		wait <- struct{}{}
+	}
+
+	err = stream.Err()
+	var connectErr *connect.Error
+	assert.NotNil(t, err)
+	assert.True(t, errors.As(err, &connectErr))
+	assert.Equal(t, connectErr.Code(), connect.CodeCanceled)
+	assert.False(t, connect.IsWireError(err))
+}
+
 func TestGRPCMarshalStatusError(t *testing.T) {
 	t.Parallel()
 
