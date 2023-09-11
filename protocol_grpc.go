@@ -337,9 +337,6 @@ func (cc *grpcClientConn) CloseRequest() error {
 }
 
 func (cc *grpcClientConn) Receive(msg any) error {
-	if err := cc.duplexCall.BlockUntilResponseReady(); err != nil {
-		return err
-	}
 	buffer := cc.BufferPool.Get()
 	defer cc.BufferPool.Put(buffer)
 

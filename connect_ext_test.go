@@ -290,9 +290,11 @@ func TestServer(t *testing.T) {
 			stream.RequestHeader().Set(clientHeader, headerValue)
 			assert.Nil(t, stream.Send(&pingv1.CumSumRequest{Number: 8}))
 			cancel()
+
 			// On a subsequent send, ensure that we are still catching context
 			// cancellations.
 			err := stream.Send(&pingv1.CumSumRequest{Number: 19})
+			t.Log(err)
 			assert.Equal(t, connect.CodeOf(err), connect.CodeCanceled, assert.Sprintf("%v", err))
 			assert.False(t, connect.IsWireError(err))
 		})

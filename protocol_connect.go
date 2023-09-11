@@ -427,9 +427,6 @@ func (cc *connectUnaryClientConn) Receive(msg any) error {
 		return io.EOF
 	}
 	cc.alreadyRead = true
-	if err := cc.duplexCall.BlockUntilResponseReady(); err != nil {
-		return err
-	}
 
 	buffer := cc.BufferPool.Get()
 	defer cc.BufferPool.Put(buffer)
@@ -577,9 +574,6 @@ func (cc *connectStreamingClientConn) CloseRequest() error {
 }
 
 func (cc *connectStreamingClientConn) Receive(msg any) error {
-	if err := cc.duplexCall.BlockUntilResponseReady(); err != nil {
-		return err
-	}
 	buffer := cc.BufferPool.Get()
 	defer cc.BufferPool.Put(buffer)
 

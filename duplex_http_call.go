@@ -31,6 +31,7 @@ import (
 //
 // Be warned: we need to use some lesser-known APIs to do this with net/http.
 type duplexHTTPCall struct {
+	done       <-chan struct{} // context cancellation
 	httpClient HTTPClient
 	onRequest  func(*http.Request)
 	onResponse func(*http.Response) *Error
@@ -59,6 +60,7 @@ func (d *duplexHTTPCall) Setup(
 	// to mutate the req.URL, we don't feel the effects of it.
 	url = cloneURL(url)
 
+	d.done = ctx.Done()
 	d.httpClient = httpClient
 	d.streamType = spec.StreamType
 	contentLength := int64(0)
@@ -66,14 +68,17 @@ func (d *duplexHTTPCall) Setup(
 	if d.isClientStream() {
 		contentLength = -1
 		body, d.requestBodyWriter = io.Pipe()
-		// Always close the pipe to avoid locking on Reads and allow
-		// context errors to propagate.
-		//
-		// See: https://github.com/golang/go/issues/53362
-		go func() {
-			<-ctx.Done()
-			d.requestBodyWriter.CloseWithError(ctx.Err())
-		}()
+		if d.done != nil {
+			// Always close the pipe to avoid locking on Reads and allow
+			// context errors to propagate.
+			//
+			// See: https://github.com/golang/go/issues/53362
+			go func() {
+				<-ctx.Done()
+				err := wrapIfContextError(ctx.Err())
+				d.requestBodyWriter.CloseWithError(err)
+			}()
+		}
 	}
 
 	// This is mirroring what http.NewRequestContext did, but
@@ -102,6 +107,9 @@ func (d *duplexHTTPCall) isClientStream() bool {
 }
 
 func (d *duplexHTTPCall) Send(buf *bytes.Buffer) error {
+	if err := d.checkCtx(); err != nil {
+		return err
+	}
 	if d.isClientStream() {
 		d.ensureRequestMade()
 		if err := writeAll(d.requestBodyWriter, buf); err != nil {
@@ -127,6 +135,9 @@ func (d *duplexHTTPCall) Send(buf *bytes.Buffer) error {
 	return d.responseErr
 }
 func (d *duplexHTTPCall) SendEnvelope(buf *bytes.Buffer, flags uint8) error {
+	if err := d.checkCtx(); err != nil {
+		return err
+	}
 	if d.isClientStream() {
 		d.ensureRequestMade()
 		if err := writeEnvelope(d.requestBodyWriter, buf, flags); err != nil {
@@ -189,6 +200,9 @@ func (d *duplexHTTPCall) Response() (*http.Response, error) {
 }
 
 func (d *duplexHTTPCall) Receive(buf *bytes.Buffer, readMaxBytes int) error {
+	if err := d.checkCtx(); err != nil {
+		return err
+	}
 	response, err := d.Response() //nolint:bodyclose
 	if err != nil {
 		return err
@@ -199,6 +213,9 @@ func (d *duplexHTTPCall) Receive(buf *bytes.Buffer, readMaxBytes int) error {
 	return nil
 }
 func (d *duplexHTTPCall) ReceiveEnvelope(buf *bytes.Buffer, readMaxBytes int) (uint8, error) {
+	if err := d.checkCtx(); err != nil {
+		return 0, err
+	}
 	response, err := d.Response() //nolint:bodyclose
 	if err != nil {
 		return 0, err
@@ -232,6 +249,18 @@ func (d *duplexHTTPCall) ResponseTrailer() http.Header {
 func (d *duplexHTTPCall) BlockUntilResponseReady() error {
 	d.responseReady.Wait()
 	return d.responseErr
+}
+
+func (d *duplexHTTPCall) checkCtx() error {
+	if d.done == nil {
+		return nil
+	}
+	select {
+	case <-d.done:
+		return wrapIfContextError(d.request.Context().Err())
+	default:
+		return nil
+	}
 }
 
 func (d *duplexHTTPCall) ensureRequestMade() {
@@ -297,8 +326,8 @@ func (d *duplexHTTPCall) makeRequest() {
 			response.ProtoMajor,
 			response.ProtoMinor,
 		)
-		d.request.Body.Close()
-		d.response.Body.Close()
+		_ = d.CloseRead()
+		_ = d.CloseWrite()
 	}
 }
 
