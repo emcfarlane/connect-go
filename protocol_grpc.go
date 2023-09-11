@@ -271,23 +271,17 @@ func (g *grpcClient) NewConn(
 			header[grpcHeaderTimeout] = []string{encodedDeadline}
 		}
 	}
-	duplexCall := newDuplexHTTPCall(
-		ctx,
-		g.HTTPClient,
-		g.URL,
-		spec,
-		header,
-	)
 	conn := &grpcClientConn{
 		grpcClient:          g,
 		spec:                spec,
-		duplexCall:          duplexCall,
 		responseHeader:      make(http.Header),
 		responseTrailer:     make(http.Header),
 		sendCompressionPool: g.CompressionPools.Get(g.CompressionName),
 		recvCompressionPool: nil, // set in SetValidateResponse
 	}
-	duplexCall.SetValidateResponse(conn.validateResponse)
+	conn.duplexCall.Setup(
+		ctx, g.HTTPClient, g.URL, spec, header, conn.validateResponse,
+	)
 	return wrapClientConnWithCodedErrors(conn)
 }
 
@@ -296,7 +290,7 @@ type grpcClientConn struct {
 	*grpcClient
 
 	spec                Spec
-	duplexCall          *duplexHTTPCall
+	duplexCall          duplexHTTPCall
 	responseHeader      http.Header
 	responseTrailer     http.Header
 	sendCompressionPool *compressionPool
@@ -328,14 +322,14 @@ func (cc *grpcClientConn) Send(msg any) error {
 	if err := checkSendMaxBytes(buffer.Len(), cc.SendMaxBytes, flags&flagEnvelopeCompressed > 0); err != nil {
 		return err
 	}
-	if err := writeEnvelope(cc.duplexCall, buffer, flags); err != nil {
+	if err := cc.duplexCall.SendEnvelope(buffer, flags); err != nil {
 		return err
 	}
 	return nil // must be a literal nil: nil *Error is a non-nil error
 }
 
 func (cc *grpcClientConn) RequestHeader() http.Header {
-	return cc.duplexCall.Header()
+	return cc.duplexCall.Request().Header
 }
 
 func (cc *grpcClientConn) CloseRequest() error {
@@ -343,11 +337,13 @@ func (cc *grpcClientConn) CloseRequest() error {
 }
 
 func (cc *grpcClientConn) Receive(msg any) error {
+	if err := cc.duplexCall.BlockUntilResponseReady(); err != nil {
+		return err
+	}
 	buffer := cc.BufferPool.Get()
 	defer cc.BufferPool.Put(buffer)
-	cc.duplexCall.BlockUntilResponseReady()
 
-	flags, err := readEnvelope(buffer, cc.duplexCall, cc.ReadMaxBytes)
+	flags, err := cc.duplexCall.ReceiveEnvelope(buffer, cc.ReadMaxBytes)
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
 			return err
@@ -372,7 +368,7 @@ func (cc *grpcClientConn) Receive(msg any) error {
 			return err
 		}
 	}
-	if flags&grpcFlagEnvelopeTrailer != 0 {
+	if flags&grpcFlagEnvelopeTrailer != 0 { //nolint:nestif
 		if !cc.web {
 			return newErrInvalidEnvelopeFlags(flags)
 		}
@@ -397,7 +393,11 @@ func (cc *grpcClientConn) Receive(msg any) error {
 		if err := grpcErrorFromTrailer(cc.Protobuf, cc.responseTrailer); err != nil {
 			return err
 		}
-		return ensureEOF(cc.duplexCall)
+		response, err := cc.duplexCall.Response() //nolint:bodyclose
+		if err != nil {
+			return err
+		}
+		return ensureEOF(response.Body)
 	}
 	if err := unmarshal(buffer, msg, cc.Codec); err != nil {
 		return err
@@ -406,12 +406,12 @@ func (cc *grpcClientConn) Receive(msg any) error {
 }
 
 func (cc *grpcClientConn) ResponseHeader() http.Header {
-	cc.duplexCall.BlockUntilResponseReady()
+	_ = cc.duplexCall.BlockUntilResponseReady()
 	return cc.responseHeader
 }
 
 func (cc *grpcClientConn) ResponseTrailer() http.Header {
-	cc.duplexCall.BlockUntilResponseReady()
+	_ = cc.duplexCall.BlockUntilResponseReady()
 	return cc.responseTrailer
 }
 
@@ -420,7 +420,7 @@ func (cc *grpcClientConn) CloseResponse() error {
 }
 
 func (cc *grpcClientConn) onRequestSend(fn func(*http.Request)) {
-	cc.duplexCall.onRequestSend = fn
+	cc.duplexCall.onRequest = fn
 }
 
 func (cc *grpcClientConn) validateResponse(response *http.Response) *Error {

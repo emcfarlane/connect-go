@@ -167,17 +167,18 @@ func TestServer(t *testing.T) {
 			assert.Equal(t, got, expect)
 		})
 		t.Run("count_up_error", func(t *testing.T) {
-			stream, err := client.CountUp(
-				context.Background(),
-				connect.NewRequest(&pingv1.CountUpRequest{Number: 1}),
-			)
-			assert.Nil(t, err)
-			for stream.Receive() {
-				t.Fatalf("expected error, shouldn't receive any messages")
+			request := connect.NewRequest(&pingv1.CountUpRequest{Number: 1})
+			stream, err := client.CountUp(context.Background(), request)
+			if err == nil {
+				// Some protocols like gRPC-web return errors in
+				// response headers and can therefore error on
+				// stream creation.
+				assert.False(t, stream.Receive())
+				err = stream.Err()
 			}
 			assert.Equal(
 				t,
-				connect.CodeOf(stream.Err()),
+				connect.CodeOf(err),
 				connect.CodeInvalidArgument,
 			)
 		})
@@ -339,9 +340,14 @@ func TestServer(t *testing.T) {
 			request := connect.NewRequest(&pingv1.CountUpRequest{Number: 10})
 			request.Header().Set(clientMiddlewareErrorHeader, headerValue)
 			stream, err := client.CountUp(context.Background(), request)
-			assert.Nil(t, err)
-			assert.False(t, stream.Receive())
-			assertIsHTTPMiddlewareError(t, stream.Err())
+			if err == nil {
+				// Some protocols like gRPC-web return errors in
+				// response headers and can therefore error on
+				// stream creation.
+				assert.False(t, stream.Receive())
+				err = stream.Err()
+			}
+			assertIsHTTPMiddlewareError(t, err)
 		})
 	}
 	testMatrix := func(t *testing.T, server *httptest.Server, bidi bool) { //nolint:thelper
@@ -791,6 +797,7 @@ func TestBidiRequiresHTTP2(t *testing.T) {
 	assert.NotNil(t, err)
 	var connectErr *connect.Error
 	assert.True(t, errors.As(err, &connectErr))
+	t.Log(err)
 	assert.Equal(t, connectErr.Code(), connect.CodeUnimplemented)
 	assert.True(
 		t,
@@ -2670,3 +2677,57 @@ func (failCompressor) Close() error {
 }
 
 func (failCompressor) Reset(io.Writer) {}
+
+// func TestContextCancelation(t *testing.T) {
+// 	var wg sync.WaitGroup
+// 	wg.Add(1)
+// 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+// 		go func() {
+// 			<-r.Context().Done()
+// 			fmt.Println("s\tserver context done")
+// 		}()
+// 		fmt.Printf("s\t%ss\n", "server got request")
+//
+// 		read, err := io.ReadAll(r.Body)
+// 		if err != nil {
+// 			fmt.Printf("s\t%s\n", err)
+// 		}
+// 		fmt.Printf("s\t%s\n", string(read))
+//
+// 		time.Sleep(500 * time.Millisecond) // <<<< CHANGE ME <<<<
+//
+// 		fmt.Printf("s\t%s\n", "server sent response")
+// 		wg.Done()
+// 	}))
+// 	server.EnableHTTP2 = true
+// 	server.StartTLS()
+// 	defer server.Close()
+//
+// 	ctx := context.Background()
+// 	ctx, cancel := context.WithTimeout(ctx, time.Second)
+// 	defer cancel()
+//
+// 	rdr, wtr := io.Pipe()
+//
+// 	r, _ := http.NewRequestWithContext(ctx, http.MethodPost, server.URL, rdr)
+// 	fmt.Printf("c %s\n", "client sending req")
+// 	go func() {
+// 		wtr.Write([]byte("hello"))
+// 		time.Sleep(time.Millisecond) // <<<< CHANGE ME <<<<
+// 		cancel()
+// 		//wtr.Close()
+// 	}()
+//
+// 	client := server.Client()
+// 	rsp, err := client.Do(r)
+// 	fmt.Printf("c %s\n", "client finished")
+// 	if err != nil {
+// 		fmt.Printf("c %s\n", err)
+// 	} else {
+// 		b, _ := httputil.DumpResponse(rsp, true)
+// 		t.Log(string(b))
+// 	}
+// 	wg.Wait()
+// 	t.Log("done")
+//
+// }

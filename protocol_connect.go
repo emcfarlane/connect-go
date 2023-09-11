@@ -339,13 +339,11 @@ func (c *connectClient) NewConn(
 			} // else effectively unbounded
 		}
 	}
-	duplexCall := newDuplexHTTPCall(ctx, c.HTTPClient, c.URL, spec, header)
 	var conn streamingClientConn
 	if spec.StreamType == StreamTypeUnary {
 		unaryConn := &connectUnaryClientConn{
 			connectClient:   c,
 			spec:            spec,
-			duplexCall:      duplexCall,
 			compressionPool: c.CompressionPools.Get(c.CompressionName),
 			responseHeader:  make(http.Header),
 			responseTrailer: make(http.Header),
@@ -355,20 +353,25 @@ func (c *connectClient) NewConn(
 				unaryConn.stableCodec = stableCodec
 			}
 		}
+		unaryConn.duplexCall.Setup(
+			ctx, c.HTTPClient, c.URL, spec, header,
+			unaryConn.validateResponse,
+		)
 		conn = unaryConn
-		duplexCall.SetValidateResponse(unaryConn.validateResponse)
 	} else {
 		streamingConn := &connectStreamingClientConn{
 			connectClient:       c,
 			spec:                spec,
-			duplexCall:          duplexCall,
 			sendCompressionPool: c.CompressionPools.Get(c.CompressionName),
 			recvCompressionPool: nil, // set by validateResponse
 			responseHeader:      make(http.Header),
 			responseTrailer:     make(http.Header),
 		}
+		streamingConn.duplexCall.Setup(
+			ctx, c.HTTPClient, c.URL, spec, header,
+			streamingConn.validateResponse,
+		)
 		conn = streamingConn
-		duplexCall.SetValidateResponse(streamingConn.validateResponse)
 	}
 	return wrapClientConnWithCodedErrors(conn)
 }
@@ -377,7 +380,7 @@ type connectUnaryClientConn struct {
 	*connectClient
 
 	spec            Spec
-	duplexCall      *duplexHTTPCall
+	duplexCall      duplexHTTPCall
 	compressionPool *compressionPool // set by validateResponse
 	responseHeader  http.Header
 	responseTrailer http.Header
@@ -412,7 +415,7 @@ func (cc *connectUnaryClientConn) Send(msg any) error {
 }
 
 func (cc *connectUnaryClientConn) RequestHeader() http.Header {
-	return cc.duplexCall.Header()
+	return cc.duplexCall.Request().Header
 }
 
 func (cc *connectUnaryClientConn) CloseRequest() error {
@@ -424,11 +427,13 @@ func (cc *connectUnaryClientConn) Receive(msg any) error {
 		return io.EOF
 	}
 	cc.alreadyRead = true
-	cc.duplexCall.BlockUntilResponseReady()
+	if err := cc.duplexCall.BlockUntilResponseReady(); err != nil {
+		return err
+	}
 
 	buffer := cc.BufferPool.Get()
 	defer cc.BufferPool.Put(buffer)
-	if err := readAll(buffer, cc.duplexCall, cc.ReadMaxBytes); err != nil {
+	if err := cc.duplexCall.Receive(buffer, cc.ReadMaxBytes); err != nil {
 		return err
 	}
 	if cc.compressionPool != nil {
@@ -439,19 +444,23 @@ func (cc *connectUnaryClientConn) Receive(msg any) error {
 	if err := unmarshal(buffer, msg, cc.Codec); err != nil {
 		return err
 	}
-	if err := ensureEOF(cc.duplexCall); !errors.Is(err, io.EOF) {
+	response, err := cc.duplexCall.Response() //nolint:bodyclose
+	if err != nil {
+		return err
+	}
+	if err := ensureEOF(response.Body); !errors.Is(err, io.EOF) {
 		return err
 	}
 	return nil // must be a literal nil: nil *Error is a non-nil error
 }
 
 func (cc *connectUnaryClientConn) ResponseHeader() http.Header {
-	cc.duplexCall.BlockUntilResponseReady()
+	_ = cc.duplexCall.BlockUntilResponseReady()
 	return cc.responseHeader
 }
 
 func (cc *connectUnaryClientConn) ResponseTrailer() http.Header {
-	cc.duplexCall.BlockUntilResponseReady()
+	_ = cc.duplexCall.BlockUntilResponseReady()
 	return cc.responseTrailer
 }
 
@@ -460,7 +469,7 @@ func (cc *connectUnaryClientConn) CloseResponse() error {
 }
 
 func (cc *connectUnaryClientConn) onRequestSend(fn func(*http.Request)) {
-	cc.duplexCall.onRequestSend = fn
+	cc.duplexCall.onRequest = fn
 }
 
 func (cc *connectUnaryClientConn) validateResponse(response *http.Response) *Error {
@@ -521,7 +530,7 @@ type connectStreamingClientConn struct {
 	*connectClient
 
 	spec                Spec
-	duplexCall          *duplexHTTPCall
+	duplexCall          duplexHTTPCall
 	sendCompressionPool *compressionPool
 	recvCompressionPool *compressionPool
 	responseHeader      http.Header
@@ -553,14 +562,14 @@ func (cc *connectStreamingClientConn) Send(msg any) error {
 	if err := checkSendMaxBytes(buffer.Len(), cc.SendMaxBytes, flags&flagEnvelopeCompressed > 0); err != nil {
 		return err
 	}
-	if err := writeEnvelope(cc.duplexCall, buffer, flags); err != nil {
+	if err := cc.duplexCall.SendEnvelope(buffer, flags); err != nil {
 		return err
 	}
 	return nil // must be a literal nil: nil *error is a non-nil error
 }
 
 func (cc *connectStreamingClientConn) RequestHeader() http.Header {
-	return cc.duplexCall.Header()
+	return cc.duplexCall.Request().Header
 }
 
 func (cc *connectStreamingClientConn) CloseRequest() error {
@@ -568,11 +577,13 @@ func (cc *connectStreamingClientConn) CloseRequest() error {
 }
 
 func (cc *connectStreamingClientConn) Receive(msg any) error {
-	cc.duplexCall.BlockUntilResponseReady()
+	if err := cc.duplexCall.BlockUntilResponseReady(); err != nil {
+		return err
+	}
 	buffer := cc.BufferPool.Get()
 	defer cc.BufferPool.Put(buffer)
 
-	flags, err := readEnvelope(buffer, cc.duplexCall, cc.ReadMaxBytes)
+	flags, err := cc.duplexCall.ReceiveEnvelope(buffer, cc.ReadMaxBytes)
 	if err != nil {
 		// If the error is EOF but not from a last message, we want to return
 		// io.ErrUnexpectedEOF instead.
@@ -606,30 +617,31 @@ func (cc *connectStreamingClientConn) Receive(msg any) error {
 			// error.
 			serverErr.meta = cc.responseHeader.Clone()
 			mergeHeaders(serverErr.meta, cc.responseTrailer)
-			cc.duplexCall.SetError(serverErr)
 			return serverErr
 		}
-		return ensureEOF(cc.duplexCall)
+		response, rerr := cc.duplexCall.Response() //nolint:bodyclose
+		if rerr != nil {
+			return err
+		}
+		return ensureEOF(response.Body)
 	}
 
 	if err := unmarshal(buffer, msg, cc.Codec); err != nil {
 		// There's no error in the trailers, so this was probably an error
 		// converting the bytes to a message, an error reading from the network, or
-		// just an EOF. We're going to return it to the user, but we also want to
-		// setResponseError so Send errors out.
-		cc.duplexCall.SetError(err)
+		// just an EOF.
 		return err
 	}
 	return nil // must be a literal nil: nil *Error is a non-nil error
 }
 
 func (cc *connectStreamingClientConn) ResponseHeader() http.Header {
-	cc.duplexCall.BlockUntilResponseReady()
+	_ = cc.duplexCall.BlockUntilResponseReady()
 	return cc.responseHeader
 }
 
 func (cc *connectStreamingClientConn) ResponseTrailer() http.Header {
-	cc.duplexCall.BlockUntilResponseReady()
+	_ = cc.duplexCall.BlockUntilResponseReady()
 	return cc.responseTrailer
 }
 
@@ -638,7 +650,7 @@ func (cc *connectStreamingClientConn) CloseResponse() error {
 }
 
 func (cc *connectStreamingClientConn) onRequestSend(fn func(*http.Request)) {
-	cc.duplexCall.onRequestSend = fn
+	cc.duplexCall.onRequest = fn
 }
 
 func (cc *connectStreamingClientConn) validateResponse(response *http.Response) *Error {
@@ -674,8 +686,7 @@ type connectUnaryHandlerConn struct {
 	recvCompressionPool *compressionPool
 	sendCompressionName string
 	sendCompressionPool *compressionPool
-	alreadyRead         bool
-	wroteBody           bool
+	sent, received      bool
 }
 
 func (hc *connectUnaryHandlerConn) Spec() Spec {
@@ -687,13 +698,12 @@ func (hc *connectUnaryHandlerConn) Peer() Peer {
 }
 
 func (hc *connectUnaryHandlerConn) Receive(msg any) error {
-	if hc.alreadyRead {
-		return NewError(CodeInternal, io.EOF)
+	if hc.received {
+		return io.EOF
 	}
-	hc.alreadyRead = true
+	hc.received = true
 	buffer := hc.BufferPool.Get()
 	defer hc.BufferPool.Put(buffer)
-
 	if err := readAll(buffer, hc.requestBody, hc.ReadMaxBytes); err != nil {
 		return err
 	}
@@ -718,13 +728,15 @@ func (hc *connectUnaryHandlerConn) RequestHeader() http.Header {
 }
 
 func (hc *connectUnaryHandlerConn) Send(msg any) error {
-	hc.wroteBody = true
+	if hc.sent {
+		return errorf(CodeInternal, "Send called twice")
+	}
+	hc.sent = true
 	hc.writeResponseHeader(nil /* error */)
 	header := hc.responseWriter.Header()
 
 	buffer := hc.BufferPool.Get()
 	defer hc.BufferPool.Put(buffer)
-
 	if err := marshal(buffer, msg, hc.codec); err != nil {
 		return err
 	}
@@ -754,7 +766,7 @@ func (hc *connectUnaryHandlerConn) ResponseTrailer() http.Header {
 }
 
 func (hc *connectUnaryHandlerConn) Close(err error) error {
-	if !hc.wroteBody {
+	if !hc.sent {
 		hc.writeResponseHeader(err)
 		// If the handler received a GET request and the resource hasn't changed,
 		// return a 304.
@@ -833,6 +845,7 @@ func (hc *connectStreamingHandlerConn) Receive(msg any) error {
 	if err != nil {
 		return err
 	}
+
 	if flags&flagEnvelopeCompressed != 0 {
 		if hc.recvCompressionPool == nil {
 			return errorf(CodeInvalidArgument,
@@ -941,13 +954,13 @@ func (cc *connectUnaryClientConn) sendMsg(buffer *bytes.Buffer, msg any) error {
 		if err := cc.compressionPool.Compress(cc.BufferPool, buffer); err != nil {
 			return err
 		}
-		setHeaderCanonical(cc.duplexCall.Header(), connectUnaryHeaderCompression, cc.CompressionName)
+		setHeaderCanonical(cc.duplexCall.Request().Header, connectUnaryHeaderCompression, cc.CompressionName)
 	}
 	if err := checkSendMaxBytes(buffer.Len(), cc.SendMaxBytes, isCompressed); err != nil {
-		delHeaderCanonical(cc.duplexCall.Header(), connectUnaryHeaderCompression)
+		delHeaderCanonical(cc.duplexCall.Request().Header, connectUnaryHeaderCompression)
 		return err
 	}
-	if err := writeAll(cc.duplexCall, buffer); err != nil {
+	if err := cc.duplexCall.Send(buffer); err != nil {
 		return err
 	}
 	return nil
@@ -997,7 +1010,7 @@ func (cc *connectUnaryClientConn) trySendGet(buffer *bytes.Buffer, msg any) erro
 		)
 	}
 
-	header := cc.duplexCall.Header()
+	header := cc.duplexCall.Request().Header
 	url := cc.buildGetURL(buffer.Bytes(), isCompressed)
 	if cc.GetURLMaxBytes > 0 && len(url.String()) > cc.GetURLMaxBytes {
 		if cc.GetUseFallback {
@@ -1011,13 +1024,13 @@ func (cc *connectUnaryClientConn) trySendGet(buffer *bytes.Buffer, msg any) erro
 	}
 
 	delete(header, connectHeaderProtocolVersion)
-	cc.duplexCall.SetMethod(http.MethodGet)
-	*cc.duplexCall.URL() = *url
+	cc.duplexCall.Request().Method = http.MethodGet
+	*cc.duplexCall.Request().URL = *url
 	return nil
 }
 
 func (cc *connectUnaryClientConn) buildGetURL(data []byte, compressed bool) *url.URL {
-	url := *cc.duplexCall.URL()
+	url := *cc.duplexCall.Request().URL
 	query := url.Query()
 	query.Set(connectUnaryConnectQueryParameter, connectUnaryConnectQueryValue)
 	query.Set(connectUnaryEncodingQueryParameter, cc.Codec.Name())

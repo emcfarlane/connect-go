@@ -25,7 +25,47 @@ import (
 // same meaning in the gRPC-Web, gRPC-HTTP2, and Connect protocols.
 const flagEnvelopeCompressed = 0b00000001
 
-var errEOF = errorf(CodeInternal, "%w", io.EOF)
+type envelope struct {
+	Data   *bytes.Buffer
+	Flags  uint8
+	offset int
+}
+
+func (e *envelope) Read(data []byte) (n int, err error) {
+	if e.offset < 5 {
+		prefix := makePrefix(e.Flags, e.Data.Len())
+		n = copy(data, prefix[e.offset:])
+		e.offset += n
+		if e.offset < 5 {
+			return n, nil
+		}
+	}
+	msg := e.Data.Bytes()[e.offset-5:]
+	wroteN := copy(data[n:], msg)
+	e.offset += wroteN
+	n += wroteN
+	if n == 0 {
+		err = io.EOF
+	}
+	return n, err
+}
+func (e *envelope) WriteTo(dst io.Writer) (n int64, err error) {
+	if e.offset < 5 {
+		prefix := makePrefix(e.Flags, e.Data.Len())
+		prefixN, err := dst.Write(prefix[e.offset:])
+		e.offset += prefixN
+		n += int64(prefixN)
+		if e.offset < 5 {
+			return n, err
+		}
+	}
+	wroteN, err := dst.Write(e.Data.Bytes()[e.offset-5:])
+	e.offset += wroteN
+	n += int64(wroteN)
+	return n, err
+}
+func (e *envelope) Rewind()  { e.offset = 0 }
+func (e *envelope) Len() int { return e.Data.Len() + 5 }
 
 func marshal(dst *bytes.Buffer, message any, codec Codec) *Error {
 	if message == nil {
@@ -95,6 +135,7 @@ func readAll(dst *bytes.Buffer, src io.Reader, readMaxBytes int) *Error {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
+			err = wrapIfContextError(err)
 			if writeErr, ok := asError(err); ok {
 				return writeErr
 			}
@@ -107,20 +148,24 @@ func readAll(dst *bytes.Buffer, src io.Reader, readMaxBytes int) *Error {
 }
 
 func readEnvelope(dst *bytes.Buffer, src io.Reader, readMaxBytes int) (uint8, *Error) {
+	wrapErr := func(err error) *Error {
+		if errors.Is(err, io.EOF) {
+			return errEOF
+		}
+		err = wrapIfContextError(err)
+		err = wrapIfRSTError(err)
+		if err, ok := asError(err); ok {
+			return err
+		}
+		return errorf(CodeInternal, "incomplete envelope: %w", err)
+	}
 	prefix := [5]byte{}
 	if _, err := io.ReadFull(src, prefix[:]); err != nil {
-		if errors.Is(err, io.EOF) {
-			return 0, errEOF
-		}
-		// Something else has gone wrong - the stream didn't end cleanly.
-		if connectErr, ok := asError(err); ok {
-			return 0, connectErr
-		}
 		if maxBytesErr := asMaxBytesError(err, "read 5 byte message prefix"); maxBytesErr != nil {
 			// We're reading from an http.MaxBytesHandler, and we've exceeded the read limit.
 			return 0, maxBytesErr
 		}
-		return 0, errorf(CodeInternal, "incomplete envelope: %w", err)
+		return 0, wrapErr(err)
 	}
 
 	size := int(binary.BigEndian.Uint32(prefix[1:5]))
@@ -135,7 +180,6 @@ func readEnvelope(dst *bytes.Buffer, src io.Reader, readMaxBytes int) (uint8, *E
 	case size == 0:
 		return prefix[0], nil
 	}
-
 	// Don't allocate the entire buffer up front to avoid malicious clients.
 	// Instead, limit the size of the source to the message size.
 	src = io.LimitReader(src, int64(size))
@@ -144,10 +188,10 @@ func readEnvelope(dst *bytes.Buffer, src io.Reader, readMaxBytes int) (uint8, *E
 			// We're reading from an http.MaxBytesHandler, and we've exceeded the read limit.
 			return 0, maxBytesErr
 		}
-		return 0, errorf(CodeInternal, "incomplete envelope: %w", err)
+		return 0, wrapErr(err)
 	} else if readN != int64(size) {
 		err = io.ErrUnexpectedEOF
-		return 0, errorf(CodeInternal, "incomplete envelope: %w", err)
+		return 0, wrapErr(err)
 	}
 	return prefix[0], nil
 }
@@ -163,9 +207,7 @@ func writeAll(dst io.Writer, src *bytes.Buffer) *Error {
 }
 
 func writeEnvelope(dst io.Writer, src *bytes.Buffer, flags uint8) *Error {
-	prefix := [5]byte{}
-	prefix[0] = flags
-	binary.BigEndian.PutUint32(prefix[1:5], uint32(src.Len()))
+	prefix := makePrefix(flags, src.Len())
 	if _, err := dst.Write(prefix[:]); err != nil {
 		if writeErr, ok := asError(err); ok {
 			return writeErr
@@ -173,6 +215,13 @@ func writeEnvelope(dst io.Writer, src *bytes.Buffer, flags uint8) *Error {
 		return errorf(CodeUnknown, "write envelope: %w", err)
 	}
 	return writeAll(dst, src)
+}
+
+func makePrefix(flags uint8, size int) [5]byte {
+	prefix := [5]byte{}
+	prefix[0] = flags
+	binary.BigEndian.PutUint32(prefix[1:5], uint32(size))
+	return prefix
 }
 
 func checkSendMaxBytes(length, sendMaxBytes int, isCompressed bool) *Error {

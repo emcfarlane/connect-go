@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,6 +38,8 @@ var (
 	errNotModified = errors.New("not modified")
 	// errNotModifiedClient wraps ErrNotModified for use client-side.
 	errNotModifiedClient = fmt.Errorf("HTTP 304: %w", errNotModified)
+	// errEOF is a sentinel error used to signal the end of a stream.
+	errEOF = errorf(CodeInternal, "%w", io.EOF)
 )
 
 // An ErrorDetail is a self-describing Protobuf message attached to an [*Error].
@@ -365,16 +368,14 @@ func wrapIfRSTError(err error) error {
 	if _, ok := asError(err); ok {
 		return err
 	}
-	if urlErr := new(url.Error); errors.As(err, &urlErr) {
+	if urlErr := (*url.Error)(nil); errors.As(err, &urlErr) {
 		// If we get an RST_STREAM error from http.Client.Do, it's wrapped in a
 		// *url.Error.
 		err = urlErr.Unwrap()
 	}
+
 	msg := err.Error()
 	if !strings.HasPrefix(msg, streamErrPrefix) {
-		return err
-	}
-	if !strings.HasSuffix(msg, fromPeerSuffix) {
 		return err
 	}
 	msg = strings.TrimSuffix(msg, fromPeerSuffix)
@@ -399,6 +400,17 @@ func wrapIfRSTError(err error) error {
 	default:
 		return err
 	}
+}
+
+// wrapIfPipeError wraps io.ErrClosedPipe with io.EOF.
+func wrapIfPipeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, io.ErrClosedPipe) {
+		return errEOF
+	}
+	return err
 }
 
 func asMaxBytesError(err error, tmpl string, args ...any) *Error {
