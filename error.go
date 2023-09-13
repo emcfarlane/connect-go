@@ -38,8 +38,6 @@ var (
 	errNotModified = errors.New("not modified")
 	// errNotModifiedClient wraps ErrNotModified for use client-side.
 	errNotModifiedClient = fmt.Errorf("HTTP 304: %w", errNotModified)
-	// errEOF is a sentinel error used to signal the end of a stream.
-	errEOF = errorf(CodeInternal, "%w", io.EOF)
 )
 
 // An ErrorDetail is a self-describing Protobuf message attached to an [*Error].
@@ -408,7 +406,7 @@ func wrapIfPipeError(err error) error {
 		return nil
 	}
 	if errors.Is(err, io.ErrClosedPipe) {
-		return errEOF
+		return io.EOF
 	}
 	return err
 }

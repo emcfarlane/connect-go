@@ -26,12 +26,18 @@ import (
 // same meaning in the gRPC-Web, gRPC-HTTP2, and Connect protocols.
 const flagEnvelopeCompressed = 0b00000001
 
+// messageBuffer is a rewindable buffer that holds a message payload.
+// A buffer can be rewound if it hasn't been returned to a bufferPool.
+// Calling SetPool before Close will cause the buffer to be returned to the pool.
+// Otherwise, Close is a no-op.
 type messageBuffer interface {
-	io.Reader
+	io.ReadCloser
 	io.WriterTo
-	io.Closer
+	// Rewind is analogous to io.Seeker.Seek(0, io.SeekStart).
 	Rewind() bool
+	// Len returns the length of the buffer.
 	Len() int
+	// SetPool sets the bufferPool that the buffer will be returned to on Close.
 	SetPool(*bufferPool)
 }
 
@@ -136,6 +142,17 @@ func (e *messageEnvelope) WriteTo(dst io.Writer) (n int64, err error) {
 	nn, err := e.writeToWithLock(dst)
 	return nn + n, err
 }
+func (e *messageEnvelope) Rewind() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pool != nil {
+		return false // can't rewind a pooled buffer
+	}
+	e.offset = 0
+	e.prefixOffset = 0
+	return e.Data != nil
+
+}
 func (e *messageEnvelope) Len() int {
 	return e.messagePayload.Len() + 5
 }
@@ -222,9 +239,6 @@ func readAll(dst *bytes.Buffer, src io.Reader, readMaxBytes int) *Error {
 
 func readEnvelope(dst *bytes.Buffer, src io.Reader, readMaxBytes int) (uint8, *Error) {
 	wrapErr := func(err error) *Error {
-		if errors.Is(err, io.EOF) {
-			return errEOF
-		}
 		err = wrapIfContextError(err)
 		err = wrapIfRSTError(err)
 		if err, ok := asError(err); ok {

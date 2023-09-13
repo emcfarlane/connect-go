@@ -108,6 +108,8 @@ func (d *duplexHTTPCall) isClientStream() bool {
 	return d.streamType&StreamTypeClient != 0
 }
 
+// Send sends the buffer to the server.
+// The buffer may be consumed by this method.
 func (d *duplexHTTPCall) Send(buf *bytes.Buffer) error {
 	if err := d.checkCtx(); err != nil {
 		return err
@@ -131,6 +133,9 @@ func (d *duplexHTTPCall) Send(buf *bytes.Buffer) error {
 	*buf = bytes.Buffer{} // hijack the buffer
 	return d.sendUnaryMessage(payload)
 }
+
+// SendEnvelope encodes the envelope and sends it to the server.
+// The buffer may be consumed by this method.
 func (d *duplexHTTPCall) SendEnvelope(buf *bytes.Buffer, flags uint8) error {
 	if err := d.checkCtx(); err != nil {
 		return err
@@ -207,6 +212,7 @@ func (d *duplexHTTPCall) Response() (*http.Response, error) {
 	return d.response, d.responseErr
 }
 
+// Receive reads the response body into the buffer.
 func (d *duplexHTTPCall) Receive(buf *bytes.Buffer, readMaxBytes int) error {
 	if err := d.checkCtx(); err != nil {
 		return err
@@ -220,6 +226,8 @@ func (d *duplexHTTPCall) Receive(buf *bytes.Buffer, readMaxBytes int) error {
 	}
 	return nil
 }
+
+// ReceiveEnvelope reads the enveloped message into the buffer and returns the flags.
 func (d *duplexHTTPCall) ReceiveEnvelope(buf *bytes.Buffer, readMaxBytes int) (uint8, error) {
 	if err := d.checkCtx(); err != nil {
 		return 0, err
