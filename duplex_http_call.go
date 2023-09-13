@@ -17,7 +17,6 @@ package connect
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -31,11 +30,12 @@ import (
 //
 // Be warned: we need to use some lesser-known APIs to do this with net/http.
 type duplexHTTPCall struct {
-	done       <-chan struct{} // context cancellation
+	ctx        context.Context
 	httpClient HTTPClient
 	onRequest  func(*http.Request)
 	onResponse func(*http.Response) *Error
 	streamType StreamType
+	bufferPool *bufferPool
 
 	// Pipe is used for client streaming RPCs.
 	requestBodyWriter *io.PipeWriter
@@ -54,13 +54,14 @@ func (d *duplexHTTPCall) Setup(
 	spec Spec,
 	header http.Header,
 	onResponse func(*http.Response) *Error,
+	pool *bufferPool,
 ) {
 	// ensure we make a copy of the url before we pass along to the
 	// Request. This ensures if a transport out of our control wants
 	// to mutate the req.URL, we don't feel the effects of it.
 	url = cloneURL(url)
 
-	d.done = ctx.Done()
+	d.ctx = ctx
 	d.httpClient = httpClient
 	d.streamType = spec.StreamType
 	contentLength := int64(0)
@@ -68,13 +69,13 @@ func (d *duplexHTTPCall) Setup(
 	if d.isClientStream() {
 		contentLength = -1
 		body, d.requestBodyWriter = io.Pipe()
-		if d.done != nil {
+		if done := ctx.Done(); done != nil {
 			// Always close the pipe to avoid locking on Reads and allow
 			// context errors to propagate.
 			//
 			// See: https://github.com/golang/go/issues/53362
 			go func() {
-				<-ctx.Done()
+				<-done
 				err := wrapIfContextError(ctx.Err())
 				d.requestBodyWriter.CloseWithError(err)
 			}()
@@ -100,6 +101,7 @@ func (d *duplexHTTPCall) Setup(
 	}).WithContext(ctx)
 	d.responseReady.Add(1)
 	d.onResponse = onResponse
+	d.bufferPool = pool
 }
 
 func (d *duplexHTTPCall) isClientStream() bool {
@@ -121,18 +123,13 @@ func (d *duplexHTTPCall) Send(buf *bytes.Buffer) error {
 		return nil
 	}
 	if d.requestSent {
-		return fmt.Errorf("duplicate send")
+		return errorf(CodeInternal, "duplicate send")
 	}
-	raw := buf.Bytes()
-	d.request.Body = io.NopCloser(buf)
-	d.request.ContentLength = int64(buf.Len())
-	d.request.GetBody = func() (io.ReadCloser, error) {
-		r := bytes.NewReader(raw)
-		return io.NopCloser(r), nil
+	payload := &messagePayload{
+		Data: buf.Bytes(),
 	}
-	d.ensureRequestMade()
-	d.request.GetBody = nil // allow GC
-	return d.responseErr
+	*buf = bytes.Buffer{} // hijack the buffer
+	return d.sendUnaryMessage(payload)
 }
 func (d *duplexHTTPCall) SendEnvelope(buf *bytes.Buffer, flags uint8) error {
 	if err := d.checkCtx(); err != nil {
@@ -149,26 +146,37 @@ func (d *duplexHTTPCall) SendEnvelope(buf *bytes.Buffer, flags uint8) error {
 		return nil
 	}
 	if d.requestSent {
-		return fmt.Errorf("duplicate send")
+		return errorf(CodeInternal, "duplicate send")
 	}
-	env := &envelope{
-		Data:  buf,
+	envelope := &messageEnvelope{
+		messagePayload: messagePayload{
+			Data: buf.Bytes(),
+		},
 		Flags: flags,
 	}
-	d.request.Body = io.NopCloser(env)
-	d.request.ContentLength = int64(env.Len())
+	*buf = bytes.Buffer{} // hijack the buffer
+	return d.sendUnaryMessage(envelope)
+}
+
+func (d *duplexHTTPCall) sendUnaryMessage(buf messageBuffer) error {
+	d.request.Body = buf
+	d.request.ContentLength = int64(buf.Len())
 	d.request.GetBody = func() (io.ReadCloser, error) {
-		env.Rewind()
-		return io.NopCloser(env), nil
+		if buf.Rewind() {
+			return buf, nil
+		}
+		return nil, io.ErrUnexpectedEOF
 	}
 	d.ensureRequestMade()
-	d.request.GetBody = nil // allow GC
+	// SetPool must be called after ensureRequestMade. Then on Close we can
+	// return the buffer to the pool.
+	buf.SetPool(d.bufferPool)
 	return d.responseErr
 }
 
 // Close the request body. Callers *must* call CloseWrite before Read when
 // using HTTP/1.x.
-func (d *duplexHTTPCall) CloseWrite() (k error) {
+func (d *duplexHTTPCall) CloseWrite() error {
 	// Even if Write was never called, we need to make an HTTP request. This
 	// ensures that we've sent any headers to the server and that we have an HTTP
 	// response to read from.
@@ -185,7 +193,7 @@ func (d *duplexHTTPCall) CloseWrite() (k error) {
 	// code for unary, client streaming, and server streaming RPCs must call
 	// CloseWrite automatically rather than requiring the user to do it.
 	if d.requestBodyWriter != nil {
-		ctxErr := d.request.Context().Err()
+		ctxErr := wrapIfContextError(d.request.Context().Err())
 		return d.requestBodyWriter.CloseWithError(ctxErr)
 	}
 	return d.request.Body.Close()
@@ -252,11 +260,8 @@ func (d *duplexHTTPCall) BlockUntilResponseReady() error {
 }
 
 func (d *duplexHTTPCall) checkCtx() error {
-	if d.done == nil {
-		return nil
-	}
 	select {
-	case <-d.done:
+	case <-d.ctx.Done():
 		return wrapIfContextError(d.request.Context().Err())
 	default:
 		return nil
@@ -294,7 +299,7 @@ func (d *duplexHTTPCall) makeRequest() {
 	}
 	// Once we send a message to the server, they send a message back and
 	// establish the receive side of the stream.
-	response, err := d.httpClient.Do(d.request) //nolint:bodyclose
+	response, err := d.httpClient.Do(d.request)
 	if err != nil {
 		err = wrapIfContextError(err)
 		err = wrapIfLikelyH2CNotConfiguredError(d.request, err)
@@ -326,8 +331,8 @@ func (d *duplexHTTPCall) makeRequest() {
 			response.ProtoMajor,
 			response.ProtoMinor,
 		)
-		_ = d.CloseRead()
-		_ = d.CloseWrite()
+		_ = d.request.Body.Close()
+		_ = response.Body.Close()
 	}
 }
 

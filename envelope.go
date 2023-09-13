@@ -19,53 +19,126 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 )
 
 // flagEnvelopeCompressed indicates that the data is compressed. It has the
 // same meaning in the gRPC-Web, gRPC-HTTP2, and Connect protocols.
 const flagEnvelopeCompressed = 0b00000001
 
-type envelope struct {
-	Data   *bytes.Buffer
-	Flags  uint8
-	offset int
+type messageBuffer interface {
+	io.Reader
+	io.WriterTo
+	io.Closer
+	Rewind() bool
+	Len() int
+	SetPool(*bufferPool)
 }
 
-func (e *envelope) Read(data []byte) (n int, err error) {
-	if e.offset < 5 {
-		prefix := makePrefix(e.Flags, e.Data.Len())
-		n = copy(data, prefix[e.offset:])
-		e.offset += n
-		if e.offset < 5 {
-			return n, nil
-		}
-	}
-	msg := e.Data.Bytes()[e.offset-5:]
-	wroteN := copy(data[n:], msg)
-	e.offset += wroteN
-	n += wroteN
+// messagePayload is a marshaled message payload.
+type messagePayload struct {
+	mu     sync.Mutex
+	Data   []byte
+	offset int
+	pool   *bufferPool
+}
+
+func (b *messagePayload) Read(data []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.readWithLock(data)
+}
+func (b *messagePayload) readWithLock(data []byte) (n int, err error) {
+	n = copy(data, b.Data[b.offset:])
+	b.offset += n
 	if n == 0 {
 		err = io.EOF
 	}
 	return n, err
 }
-func (e *envelope) WriteTo(dst io.Writer) (n int64, err error) {
-	if e.offset < 5 {
-		prefix := makePrefix(e.Flags, e.Data.Len())
-		prefixN, err := dst.Write(prefix[e.offset:])
-		e.offset += prefixN
-		n += int64(prefixN)
-		if e.offset < 5 {
-			return n, err
-		}
-	}
-	wroteN, err := dst.Write(e.Data.Bytes()[e.offset-5:])
-	e.offset += wroteN
+func (b *messagePayload) WriteTo(dst io.Writer) (n int64, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.writeToWithLock(dst)
+}
+func (b *messagePayload) writeToWithLock(dst io.Writer) (n int64, err error) {
+	wroteN, err := dst.Write(b.Data[b.offset:])
+	b.offset += wroteN
 	n += int64(wroteN)
 	return n, err
 }
-func (e *envelope) Rewind()  { e.offset = 0 }
-func (e *envelope) Len() int { return e.Data.Len() + 5 }
+
+func (b *messagePayload) Rewind() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pool != nil {
+		return false // can't rewind a pooled buffer
+	}
+	b.offset = 0
+	return b.Data != nil
+}
+func (b *messagePayload) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.Data)
+}
+func (b *messagePayload) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pool == nil || b.Data == nil {
+		return nil
+	}
+	b.pool.Put(bytes.NewBuffer(b.Data))
+	b.Data = nil
+	b.offset = 0
+	return nil
+}
+func (b *messagePayload) SetPool(pool *bufferPool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pool = pool
+}
+
+// messageEnvelope is a payload with a 5-byte prefix.
+type messageEnvelope struct {
+	messagePayload
+
+	Flags        uint8
+	prefixOffset int
+}
+
+func (e *messageEnvelope) Read(data []byte) (n int, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.prefixOffset < 5 {
+		prefix := makePrefix(e.Flags, len(e.Data))
+		n = copy(data, prefix[e.prefixOffset:])
+		e.prefixOffset += n
+		if e.prefixOffset < 5 {
+			return n, nil
+		}
+	}
+	nn, err := e.readWithLock(data[n:])
+	return nn + n, err
+}
+func (e *messageEnvelope) WriteTo(dst io.Writer) (n int64, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.prefixOffset < 5 {
+		prefix := makePrefix(e.Flags, len(e.Data))
+		prefixN, err := dst.Write(prefix[e.prefixOffset:])
+		e.prefixOffset += prefixN
+		n += int64(prefixN)
+		if e.prefixOffset < 5 {
+			return n, err
+		}
+	}
+	nn, err := e.writeToWithLock(dst)
+	return nn + n, err
+}
+func (e *messageEnvelope) Len() int {
+	return e.messagePayload.Len() + 5
+}
 
 func marshal(dst *bytes.Buffer, message any, codec Codec) *Error {
 	if message == nil {

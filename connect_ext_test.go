@@ -290,11 +290,9 @@ func TestServer(t *testing.T) {
 			stream.RequestHeader().Set(clientHeader, headerValue)
 			assert.Nil(t, stream.Send(&pingv1.CumSumRequest{Number: 8}))
 			cancel()
-
 			// On a subsequent send, ensure that we are still catching context
 			// cancellations.
 			err := stream.Send(&pingv1.CumSumRequest{Number: 19})
-			t.Log(err)
 			assert.Equal(t, connect.CodeOf(err), connect.CodeCanceled, assert.Sprintf("%v", err))
 			assert.False(t, connect.IsWireError(err))
 		})
@@ -799,7 +797,6 @@ func TestBidiRequiresHTTP2(t *testing.T) {
 	assert.NotNil(t, err)
 	var connectErr *connect.Error
 	assert.True(t, errors.As(err, &connectErr))
-	t.Log(err)
 	assert.Equal(t, connectErr.Code(), connect.CodeUnimplemented)
 	assert.True(
 		t,
@@ -2679,57 +2676,3 @@ func (failCompressor) Close() error {
 }
 
 func (failCompressor) Reset(io.Writer) {}
-
-// func TestContextCancelation(t *testing.T) {
-// 	var wg sync.WaitGroup
-// 	wg.Add(1)
-// 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-// 		go func() {
-// 			<-r.Context().Done()
-// 			fmt.Println("s\tserver context done")
-// 		}()
-// 		fmt.Printf("s\t%ss\n", "server got request")
-//
-// 		read, err := io.ReadAll(r.Body)
-// 		if err != nil {
-// 			fmt.Printf("s\t%s\n", err)
-// 		}
-// 		fmt.Printf("s\t%s\n", string(read))
-//
-// 		time.Sleep(500 * time.Millisecond) // <<<< CHANGE ME <<<<
-//
-// 		fmt.Printf("s\t%s\n", "server sent response")
-// 		wg.Done()
-// 	}))
-// 	server.EnableHTTP2 = true
-// 	server.StartTLS()
-// 	defer server.Close()
-//
-// 	ctx := context.Background()
-// 	ctx, cancel := context.WithTimeout(ctx, time.Second)
-// 	defer cancel()
-//
-// 	rdr, wtr := io.Pipe()
-//
-// 	r, _ := http.NewRequestWithContext(ctx, http.MethodPost, server.URL, rdr)
-// 	fmt.Printf("c %s\n", "client sending req")
-// 	go func() {
-// 		wtr.Write([]byte("hello"))
-// 		time.Sleep(time.Millisecond) // <<<< CHANGE ME <<<<
-// 		cancel()
-// 		//wtr.Close()
-// 	}()
-//
-// 	client := server.Client()
-// 	rsp, err := client.Do(r)
-// 	fmt.Printf("c %s\n", "client finished")
-// 	if err != nil {
-// 		fmt.Printf("c %s\n", err)
-// 	} else {
-// 		b, _ := httputil.DumpResponse(rsp, true)
-// 		t.Log(string(b))
-// 	}
-// 	wg.Wait()
-// 	t.Log("done")
-//
-// }

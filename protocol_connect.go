@@ -355,7 +355,7 @@ func (c *connectClient) NewConn(
 		}
 		unaryConn.duplexCall.Setup(
 			ctx, c.HTTPClient, c.URL, spec, header,
-			unaryConn.validateResponse,
+			unaryConn.validateResponse, c.BufferPool,
 		)
 		conn = unaryConn
 	} else {
@@ -369,7 +369,7 @@ func (c *connectClient) NewConn(
 		}
 		streamingConn.duplexCall.Setup(
 			ctx, c.HTTPClient, c.URL, spec, header,
-			streamingConn.validateResponse,
+			streamingConn.validateResponse, c.BufferPool,
 		)
 		conn = streamingConn
 	}

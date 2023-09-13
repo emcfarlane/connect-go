@@ -56,8 +56,7 @@ type inMemoryServer struct {
 // newInMemoryServer constructs and starts an inMemoryServer.
 func newInMemoryServer(handler http.Handler) *inMemoryServer {
 	lis := &memoryListener{
-		conns:  make(chan net.Conn),
-		closed: make(chan struct{}),
+		conns: make(chan acceptConn),
 	}
 	server := httptest.NewUnstartedServer(handler)
 	server.Listener = lis
@@ -94,26 +93,34 @@ func (s *inMemoryServer) Close() {
 }
 
 type memoryListener struct {
-	conns  chan net.Conn
-	once   sync.Once
-	closed chan struct{}
+	mu     sync.Mutex
+	conns  chan acceptConn
+	closed bool
+}
+
+type acceptConn struct {
+	conn     net.Conn
+	accepted chan struct{}
 }
 
 // Accept implements net.Listener.
 func (l *memoryListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-l.conns:
-		return conn, nil
-	case <-l.closed:
+	c, ok := <-l.conns
+	if !ok {
 		return nil, errors.New("listener closed")
 	}
+	close(c.accepted)
+	return c.conn, nil
 }
 
 // Close implements net.Listener.
 func (l *memoryListener) Close() error {
-	l.once.Do(func() {
-		close(l.closed)
-	})
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.closed {
+		close(l.conns)
+	}
+	l.closed = true
 	return nil
 }
 
@@ -124,14 +131,23 @@ func (l *memoryListener) Addr() net.Addr {
 
 // DialContext is the type expected by http.Transport.DialContext.
 func (l *memoryListener) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	select {
-	case <-l.closed:
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
 		return nil, errors.New("listener closed")
-	default:
 	}
 	server, client := net.Pipe()
-	l.conns <- server
-	return client, nil
+	accepted := make(chan struct{})
+	l.conns <- acceptConn{
+		conn:     server,
+		accepted: accepted,
+	}
+	select {
+	case <-accepted:
+		return client, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 type memoryAddr struct{}

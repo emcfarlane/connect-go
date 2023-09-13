@@ -41,7 +41,9 @@ func (b *bufferPool) Get() *bytes.Buffer {
 }
 
 func (b *bufferPool) Put(buf *bytes.Buffer) {
-	if buf.Cap() > maxRecycleBufferSize {
+	// Don't hold onto buffers that are too large.
+	// Or buffers that have no capacity.
+	if buf.Cap() == 0 || buf.Cap() > maxRecycleBufferSize {
 		return
 	}
 	b.Pool.Put(buf)

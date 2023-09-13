@@ -280,7 +280,8 @@ func (g *grpcClient) NewConn(
 		recvCompressionPool: nil, // set in SetValidateResponse
 	}
 	conn.duplexCall.Setup(
-		ctx, g.HTTPClient, g.URL, spec, header, conn.validateResponse,
+		ctx, g.HTTPClient, g.URL, spec, header,
+		conn.validateResponse, g.BufferPool,
 	)
 	return wrapClientConnWithCodedErrors(conn)
 }
