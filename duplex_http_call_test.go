@@ -26,22 +26,29 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestDuplexHTTPCallGetBody tests that the http.Request.GetBody function
 // is called and able to retry when the server closes the connection.
 func TestDuplexHTTPCallGetBody(t *testing.T) {
 	t.Parallel()
-
 	var getBodyCount uint32
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
 		// The "Connection: close" header is turned into a GOAWAY frame by the http2 server.
 		if atomic.LoadUint32(&getBodyCount) == 0 {
 			responseWriter.Header().Add("Connection", "close")
 		}
-		b, _ := io.ReadAll(request.Body)
-		_ = request.Body.Close()
-		_, _ = responseWriter.Write(b)
+		b, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		if err := request.Body.Close(); err != nil {
+			t.Error(err)
+		}
+		if _, err := responseWriter.Write(b); err != nil {
+			t.Error(err)
+		}
 	}))
 	server.EnableHTTP2 = true
 	server.StartTLS()
@@ -49,20 +56,25 @@ func TestDuplexHTTPCallGetBody(t *testing.T) {
 
 	bufferPool := newBufferPool()
 	serverURL, _ := url.Parse(server.URL)
+	client := server.Client()
+
+	ctx := context.Background()
 
 	errGetBodyCalled := errors.New("getBodyCalled")
 	caller := func(size int) error {
-		ctx := context.Background()
 		duplexCall := &duplexHTTPCall{}
 		duplexCall.Setup(
 			ctx,
-			server.Client(),
+			client,
 			serverURL,
 			Spec{StreamType: StreamTypeUnary},
 			http.Header{},
 			func(*http.Response) *Error { return nil },
 			bufferPool,
 		)
+		defer duplexCall.CloseRead()
+		defer duplexCall.CloseWrite()
+
 		getBodyCalled := false
 		duplexCall.onRequest = func(request *http.Request) {
 			getBody := request.GetBody
@@ -105,12 +117,14 @@ func TestDuplexHTTPCallGetBody(t *testing.T) {
 	workChan := make(chan work)
 	var wg sync.WaitGroup
 	worker := func() {
+		wg.Add(1)
 		for work := range workChan {
+			wg.Add(1)
 			work.errs <- caller(work.size)
+			wg.Done()
 		}
 		wg.Done()
 	}
-	wg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		go worker()
 	}
@@ -129,7 +143,7 @@ func TestDuplexHTTPCallGetBody(t *testing.T) {
 				if errors.Is(err, errGetBodyCalled) {
 					gotGetBody = true
 				} else if err != nil {
-					t.Fatal(err)
+					t.Error(err)
 				}
 			}
 		}
@@ -141,4 +155,7 @@ func TestDuplexHTTPCallGetBody(t *testing.T) {
 	}
 	close(workChan)
 	wg.Wait()
+	// wait for connections to close to avoid:
+	// "TLS handshake error... use of closed network connection"
+	time.Sleep(10 * time.Millisecond)
 }

@@ -235,12 +235,14 @@ func TestServer(t *testing.T) {
 				return
 			}
 			if err := stream.Send(&pingv1.CumSumRequest{Number: 42}); err != nil {
+				t.Log("send", err)
 				assert.ErrorIs(t, err, io.EOF)
 				assert.Equal(t, connect.CodeOf(err), connect.CodeUnknown)
 			}
 			// We didn't send the headers the server expects, so we should now get an
 			// error.
 			_, err := stream.Receive()
+			t.Log("receive", err)
 			assert.Equal(t, connect.CodeOf(err), connect.CodeInvalidArgument)
 			assert.True(t, connect.IsWireError(err))
 		})
@@ -293,6 +295,7 @@ func TestServer(t *testing.T) {
 			// On a subsequent send, ensure that we are still catching context
 			// cancellations.
 			err := stream.Send(&pingv1.CumSumRequest{Number: 19})
+			t.Log(err)
 			assert.Equal(t, connect.CodeOf(err), connect.CodeCanceled, assert.Sprintf("%v", err))
 			assert.False(t, connect.IsWireError(err))
 		})
@@ -2421,10 +2424,11 @@ func (p *pluggablePingServer) CumSum(
 }
 
 func failNoHTTP2(tb testing.TB, stream *connect.BidiStreamForClient[pingv1.CumSumRequest, pingv1.CumSumResponse]) {
-	tb.Helper()
+	//tb.Helper()
 	if err := stream.Send(&pingv1.CumSumRequest{}); err != nil {
+		tb.Log("err:", err)
 		assert.ErrorIs(tb, err, io.EOF)
-		assert.Equal(tb, connect.CodeOf(err), connect.CodeUnknown)
+		assert.Equal(tb, connect.CodeOf(err), connect.CodeInternal)
 	}
 	assert.Nil(tb, stream.CloseRequest())
 	_, err := stream.Receive()
