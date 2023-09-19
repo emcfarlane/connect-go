@@ -2424,7 +2424,7 @@ func (p *pluggablePingServer) CumSum(
 }
 
 func failNoHTTP2(tb testing.TB, stream *connect.BidiStreamForClient[pingv1.CumSumRequest, pingv1.CumSumResponse]) {
-	//tb.Helper()
+	tb.Helper()
 	if err := stream.Send(&pingv1.CumSumRequest{}); err != nil {
 		tb.Log("err:", err)
 		assert.ErrorIs(tb, err, io.EOF)

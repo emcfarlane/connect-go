@@ -39,14 +39,14 @@ func TestDuplexHTTPCallGetBody(t *testing.T) {
 		if atomic.LoadUint32(&getBodyCount) == 0 {
 			responseWriter.Header().Add("Connection", "close")
 		}
-		b, err := io.ReadAll(request.Body)
+		data, err := io.ReadAll(request.Body)
 		if err != nil {
 			t.Error(err)
 		}
 		if err := request.Body.Close(); err != nil {
 			t.Error(err)
 		}
-		if _, err := responseWriter.Write(b); err != nil {
+		if _, err := responseWriter.Write(data); err != nil {
 			t.Error(err)
 		}
 	}))
@@ -72,8 +72,8 @@ func TestDuplexHTTPCallGetBody(t *testing.T) {
 			func(*http.Response) *Error { return nil },
 			bufferPool,
 		)
-		defer duplexCall.CloseRead()
-		defer duplexCall.CloseWrite()
+		defer duplexCall.CloseRead()  //nolint:errcheck
+		defer duplexCall.CloseWrite() //nolint:errcheck
 
 		getBodyCalled := false
 		duplexCall.onRequest = func(request *http.Request) {

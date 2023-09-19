@@ -103,6 +103,7 @@ func TestBuffers_Compress(t *testing.T) {
 }
 
 func TestBuffers_payload(t *testing.T) {
+	t.Parallel()
 	payload := []byte(`{"number": 42}`)
 	buf := &bytes.Buffer{}
 	assert.Nil(t, writeEnvelope(buf, bytes.NewBuffer(payload), 8))

@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -398,17 +397,6 @@ func wrapIfRSTError(err error) error {
 	default:
 		return err
 	}
-}
-
-// wrapIfPipeError wraps io.ErrClosedPipe with io.EOF.
-func wrapIfPipeError(err error) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, io.ErrClosedPipe) {
-		return io.EOF
-	}
-	return err
 }
 
 func asMaxBytesError(err error, tmpl string, args ...any) *Error {
