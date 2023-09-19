@@ -26,37 +26,41 @@ import (
 // same meaning in the gRPC-Web, gRPC-HTTP2, and Connect protocols.
 const flagEnvelopeCompressed = 0b00000001
 
-// messageBuffer is a rewindable buffer that holds a message payload.
-// A buffer can be rewound if it hasn't been returned to a bufferPool.
-// Calling SetPool before Close will cause the buffer to be returned to the pool.
-// Otherwise, Close is a no-op.
-type messageBuffer interface {
-	io.ReadCloser
-	io.WriterTo
-	// Rewind is analogous to io.Seeker.Seek(0, io.SeekStart).
-	Rewind() bool
-	// Len returns the length of the buffer.
-	Len() int
-	// SetPool sets the bufferPool that the buffer will be returned to on Close.
-	SetPool(*bufferPool)
-}
-
-// messagePayload is a marshaled message payload.
+// messagePayload is a rewindable buffer for a message payload.
+// If IsEnvelope is true, then the payload has a 5 byte envelope prefix.
+// The envelope prefix is a uint8 flags byte followed by a uint32 size.
+// Rewind is analogous to io.Reader.Seek(0, io.SeekStart) returning true if the
+// buffer is not pooled.
 type messagePayload struct {
-	mu     sync.Mutex
-	Data   []byte
-	offset int
-	pool   *bufferPool
+	mu         sync.Mutex
+	Data       []byte
+	Flags      uint8
+	offset     int
+	pool       *bufferPool
+	IsEnvelope bool
+	isClosed   bool
 }
 
 func (b *messagePayload) Read(data []byte) (n int, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.readWithLock(data)
-}
-func (b *messagePayload) readWithLock(data []byte) (n int, err error) {
-	n = copy(data, b.Data[b.offset:])
-	b.offset += n
+
+	prefixSize := 0
+	if b.IsEnvelope {
+		if b.offset < 5 {
+			prefix := makePrefix(b.Flags, len(b.Data))
+			n = copy(data, prefix[b.offset:])
+			b.offset += n
+			if b.offset < 5 {
+				return n, nil
+			}
+			data = data[n:]
+		}
+		prefixSize = 5
+	}
+	wroteN := copy(data, b.Data[b.offset-prefixSize:])
+	b.offset += wroteN
+	n += wroteN
 	if n == 0 {
 		err = io.EOF
 	}
@@ -65,15 +69,28 @@ func (b *messagePayload) readWithLock(data []byte) (n int, err error) {
 func (b *messagePayload) WriteTo(dst io.Writer) (n int64, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.writeToWithLock(dst)
-}
-func (b *messagePayload) writeToWithLock(dst io.Writer) (n int64, err error) {
-	wroteN, err := dst.Write(b.Data[b.offset:])
+
+	prefixSize := 0
+	if b.IsEnvelope {
+		if b.offset < 5 {
+			prefix := makePrefix(b.Flags, len(b.Data))
+			prefixN, err := dst.Write(prefix[b.offset:])
+			b.offset += prefixN
+			n += int64(prefixN)
+			if b.offset < 5 {
+				return n, err
+			}
+		}
+		prefixSize = 5
+	}
+	wroteN, err := dst.Write(b.Data[b.offset-prefixSize:])
 	b.offset += wroteN
 	n += int64(wroteN)
 	return n, err
 }
 
+// Rewind is analogous to io.Reader.Seek(0, io.SeekStart) returning true
+// if the buffer is not pooled.
 func (b *messagePayload) Rewind() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -81,12 +98,19 @@ func (b *messagePayload) Rewind() bool {
 		return false // can't rewind a pooled buffer
 	}
 	b.offset = 0
+	b.isClosed = false
 	return b.Data != nil
 }
+
+// Len returns the length of the payload.
 func (b *messagePayload) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.Data)
+	n := len(b.Data)
+	if b.IsEnvelope {
+		n += 5
+	}
+	return n
 }
 func (b *messagePayload) Close() error {
 	b.mu.Lock()
@@ -97,64 +121,17 @@ func (b *messagePayload) Close() error {
 	b.pool.Put(bytes.NewBuffer(b.Data))
 	b.Data = nil
 	b.offset = 0
+	b.isClosed = true
 	return nil
 }
 func (b *messagePayload) SetPool(pool *bufferPool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pool = pool
-}
-
-// messageEnvelope is a payload with a 5-byte prefix.
-type messageEnvelope struct {
-	messagePayload
-
-	Flags        uint8
-	prefixOffset int
-}
-
-func (e *messageEnvelope) Read(data []byte) (n int, err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.prefixOffset < 5 {
-		prefix := makePrefix(e.Flags, len(e.Data))
-		n = copy(data, prefix[e.prefixOffset:])
-		e.prefixOffset += n
-		if e.prefixOffset < 5 {
-			return n, nil
-		}
+	if b.isClosed && b.Data != nil {
+		b.pool.Put(bytes.NewBuffer(b.Data))
+		b.Data = nil
 	}
-	nn, err := e.readWithLock(data[n:])
-	return nn + n, err
-}
-func (e *messageEnvelope) WriteTo(dst io.Writer) (n int64, err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.prefixOffset < 5 {
-		prefix := makePrefix(e.Flags, len(e.Data))
-		prefixN, err := dst.Write(prefix[e.prefixOffset:])
-		e.prefixOffset += prefixN
-		n += int64(prefixN)
-		if e.prefixOffset < 5 {
-			return n, err
-		}
-	}
-	nn, err := e.writeToWithLock(dst)
-	return nn + n, err
-}
-func (e *messageEnvelope) Rewind() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.pool != nil {
-		return false // can't rewind a pooled buffer
-	}
-	e.offset = 0
-	e.prefixOffset = 0
-	return e.Data != nil
-
-}
-func (e *messageEnvelope) Len() int {
-	return e.messagePayload.Len() + 5
 }
 
 func marshal(dst *bytes.Buffer, message any, codec Codec) *Error {

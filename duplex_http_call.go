@@ -153,29 +153,28 @@ func (d *duplexHTTPCall) SendEnvelope(buf *bytes.Buffer, flags uint8) error {
 	if d.requestSent {
 		return errorf(CodeInternal, "duplicate send")
 	}
-	envelope := &messageEnvelope{
-		messagePayload: messagePayload{
-			Data: buf.Bytes(),
-		},
-		Flags: flags,
+	envelope := &messagePayload{
+		Data:       buf.Bytes(),
+		Flags:      flags,
+		IsEnvelope: true,
 	}
 	*buf = bytes.Buffer{} // hijack the buffer
 	return d.sendUnaryMessage(envelope)
 }
 
-func (d *duplexHTTPCall) sendUnaryMessage(buf messageBuffer) error {
-	d.request.Body = buf
-	d.request.ContentLength = int64(buf.Len())
+func (d *duplexHTTPCall) sendUnaryMessage(payload *messagePayload) error {
+	d.request.Body = payload
+	d.request.ContentLength = int64(payload.Len())
 	d.request.GetBody = func() (io.ReadCloser, error) {
-		if buf.Rewind() {
-			return buf, nil
+		if payload.Rewind() {
+			return payload, nil
 		}
 		return nil, io.ErrUnexpectedEOF
 	}
 	d.ensureRequestMade()
 	// SetPool must be called after ensureRequestMade. Then on Close we can
 	// return the buffer to the pool.
-	buf.SetPool(d.bufferPool)
+	payload.SetPool(d.bufferPool)
 	return d.responseErr
 }
 

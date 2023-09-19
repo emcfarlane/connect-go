@@ -101,3 +101,25 @@ func TestBuffers_Compress(t *testing.T) {
 	// Don't check avg because it's dependent on buffer.Pool's behavior.
 	assert.Equal(t, input, src.String())
 }
+
+func TestBuffers_payload(t *testing.T) {
+	payload := []byte(`{"number": 42}`)
+	buf := &bytes.Buffer{}
+	assert.Nil(t, writeEnvelope(buf, bytes.NewBuffer(payload), 8))
+
+	msg := &messagePayload{
+		Data:       payload,
+		Flags:      8,
+		IsEnvelope: true,
+	}
+	rdFrom := &bytes.Buffer{}
+	_, err := rdFrom.ReadFrom(msg)
+	assert.Nil(t, err)
+	assert.Equal(t, buf.Bytes(), rdFrom.Bytes())
+
+	assert.True(t, msg.Rewind())
+	wrTo := &bytes.Buffer{}
+	_, err = msg.WriteTo(wrTo)
+	assert.Nil(t, err)
+	assert.Equal(t, buf.Bytes(), wrTo.Bytes())
+}
