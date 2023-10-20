@@ -17,6 +17,7 @@ package connect
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -106,7 +107,7 @@ func (c *compressionPool) Decompress(dst *bytes.Buffer, src *bytes.Buffer, readM
 	return nil
 }
 
-func (c *compressionPool) Compress(dst *bytes.Buffer, src *bytes.Buffer) *Error {
+func (c *compressionPool) Compress(dst *bytes.Buffer, src *bytes.Buffer) (cerr *Error) {
 	compressor, err := c.getCompressor(dst)
 	if err != nil {
 		return errorf(CodeUnknown, "get compressor: %w", err)

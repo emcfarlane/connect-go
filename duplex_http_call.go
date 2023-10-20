@@ -15,6 +15,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -267,7 +268,12 @@ func (d *duplexHTTPCall) makeRequest() {
 	}
 	// Once we send a message to the server, they send a message back and
 	// establish the receive side of the stream.
-	response, err := d.httpClient.Do(d.request) //nolint:bodyclose
+	d.request.Header.Set("Accept-Encoding", "identity")   // TEST
+	d.request.Header.Set("Custom-Header", "custom-value") // TEST
+	response, err := d.httpClient.Do(d.request)           //nolint:bodyclose
+	body, _ := io.ReadAll(response.Body)
+
+	response.Body = io.NopCloser(bytes.NewReader(body))
 	if err != nil {
 		err = wrapIfContextError(err)
 		err = wrapIfLikelyH2CNotConfiguredError(d.request, err)
