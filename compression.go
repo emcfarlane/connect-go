@@ -17,7 +17,6 @@ package connect
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"strings"

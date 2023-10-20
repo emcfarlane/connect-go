@@ -11,9 +11,29 @@ import (
 	"connectrpc.com/connect/internal/gen/connect/ping/v1/pingv1connect"
 )
 
+type stripTransport struct {
+	transport http.RoundTripper
+}
+
+func (s *stripTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := s.transport.RoundTrip(req)
+	if err != nil {
+		return res, err
+	}
+	res.Header.Del("Content-Encoding")
+	res.Header.Del("Content-Length")
+	return res, err
+}
+
 func ping(ctx context.Context, input string) (string, error) {
+	httpClient := &http.Client{
+		Transport: &stripTransport{
+			transport: http.DefaultTransport,
+		},
+	}
+
 	client := pingv1connect.NewPingServiceClient(
-		http.DefaultClient,
+		httpClient,
 		"",
 		connect.WithAcceptCompression("gzip", nil, nil),
 	)
