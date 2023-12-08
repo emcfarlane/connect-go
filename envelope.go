@@ -32,6 +32,62 @@ var errSpecialEnvelope = errorf(
 	io.EOF,
 )
 
+type payload struct {
+	data   bytes.Buffer
+	offset int64
+}
+
+func newPayload(data *bytes.Buffer) *payload {
+	return &payload{data: claimBuffer(data)}
+}
+
+func (p *payload) Read(data []byte) (readN int, err error) {
+	n := copy(data, p.data.Bytes()[p.offset:])
+	p.offset += int64(n)
+	readN += n
+	if readN == 0 && p.offset == int64(p.data.Len()) {
+		err = io.EOF
+	}
+	return readN, err
+}
+func (p *payload) WriteTo(dst io.Writer) (wroteN int64, err error) {
+	n, err := dst.Write(p.data.Bytes()[p.offset:])
+	p.offset += int64(n)
+	wroteN += int64(n)
+	return wroteN, err
+}
+func (p *payload) Seek(offset int64, whence int) (int64, error) {
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = p.offset + offset
+	case io.SeekEnd:
+		abs = int64(p.data.Len()) + offset
+	default:
+		return 0, errors.New("connect.payload.Seek: invalid whence")
+	}
+	if abs < 0 {
+		return 0, errors.New("connect.payload.Seek: negative position")
+	}
+	p.offset = abs
+	return abs, nil
+}
+func (p *payload) Len() int {
+	if length := int(int64(p.data.Len()) - p.offset); length > 0 {
+		return length
+	}
+	return 0
+}
+func (p *payload) Release(pool *bufferPool) {
+	if p.data.Len() > 0 {
+		data := p.data
+		pool.Put(&data)
+	}
+	*p = payload{}
+}
+
 // envelope is a block of arbitrary bytes wrapped in gRPC and Connect's framing
 // protocol.
 //
@@ -40,21 +96,31 @@ var errSpecialEnvelope = errorf(
 // message length. gRPC and Connect interpret the bitwise flags differently, so
 // envelope leaves their interpretation up to the caller.
 type envelope struct {
-	Data   *bytes.Buffer
-	Flags  uint8
+	data   bytes.Buffer
+	flags  uint8
 	offset int64
 }
 
-var _ messsagePayload = (*envelope)(nil)
+// newEnvelope returns an envelope with the given data and flags. It takes ownership
+// of the buffer and the caller is responsible for calling Release to return the
+// buffer to the pool.
+func newEnvelope(flags uint8, data *bytes.Buffer) *envelope {
+	return &envelope{
+		data:  claimBuffer(data),
+		flags: flags,
+	}
+}
+
+var _ messagePayload = (*envelope)(nil)
 
 func (e *envelope) IsSet(flag uint8) bool {
-	return e.Flags&flag == flag
+	return e.flags&flag == flag
 }
 
 // Read implements [io.Reader].
 func (e *envelope) Read(data []byte) (readN int, err error) {
 	if e.offset < 5 {
-		prefix := makeEnvelopePrefix(e.Flags, e.Data.Len())
+		prefix := makeEnvelopePrefix(e.flags, e.data.Len())
 		readN = copy(data, prefix[e.offset:])
 		e.offset += int64(readN)
 		if e.offset < 5 {
@@ -62,10 +128,10 @@ func (e *envelope) Read(data []byte) (readN int, err error) {
 		}
 		data = data[readN:]
 	}
-	n := copy(data, e.Data.Bytes()[e.offset-5:])
+	n := copy(data, e.data.Bytes()[e.offset-5:])
 	e.offset += int64(n)
 	readN += n
-	if readN == 0 && e.offset == int64(e.Data.Len()+5) {
+	if readN == 0 && e.offset == int64(e.data.Len()+5) {
 		err = io.EOF
 	}
 	return readN, err
@@ -74,7 +140,7 @@ func (e *envelope) Read(data []byte) (readN int, err error) {
 // WriteTo implements [io.WriterTo].
 func (e *envelope) WriteTo(dst io.Writer) (wroteN int64, err error) {
 	if e.offset < 5 {
-		prefix := makeEnvelopePrefix(e.Flags, e.Data.Len())
+		prefix := makeEnvelopePrefix(e.flags, e.data.Len())
 		prefixN, err := dst.Write(prefix[e.offset:])
 		e.offset += int64(prefixN)
 		wroteN += int64(prefixN)
@@ -82,7 +148,7 @@ func (e *envelope) WriteTo(dst io.Writer) (wroteN int64, err error) {
 			return wroteN, err
 		}
 	}
-	n, err := dst.Write(e.Data.Bytes()[e.offset-5:])
+	n, err := dst.Write(e.data.Bytes()[e.offset-5:])
 	e.offset += int64(n)
 	wroteN += int64(n)
 	return wroteN, err
@@ -97,7 +163,7 @@ func (e *envelope) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		abs = e.offset + offset
 	case io.SeekEnd:
-		abs = int64(e.Data.Len()) + offset
+		abs = int64(e.data.Len()) + offset
 	default:
 		return 0, errors.New("connect.envelope.Seek: invalid whence")
 	}
@@ -110,10 +176,17 @@ func (e *envelope) Seek(offset int64, whence int) (int64, error) {
 
 // Len returns the number of bytes of the unread portion of the envelope.
 func (e *envelope) Len() int {
-	if length := int(int64(e.Data.Len()) + 5 - e.offset); length > 0 {
+	if length := int(int64(e.data.Len()) + 5 - e.offset); length > 0 {
 		return length
 	}
 	return 0
+}
+func (e *envelope) Release(pool *bufferPool) {
+	if e.data.Len() > 0 {
+		data := e.data
+		pool.Put(&data)
+	}
+	*e = envelope{}
 }
 
 type envelopeWriter struct {
@@ -137,10 +210,11 @@ func (w *envelopeWriter) Marshal(message any) *Error {
 		}
 		return nil
 	}
-	if appender, ok := w.codec.(marshalAppender); ok {
-		return w.marshalAppend(message, appender)
+	buffer, err := marshal(message, w.codec, w.bufferPool)
+	if err != nil {
+		return err
 	}
-	return w.marshal(message)
+	return w.Write(&envelope{data: claimBuffer(buffer)})
 }
 
 // Write writes the enveloped message, compressing as necessary. It doesn't
@@ -148,33 +222,30 @@ func (w *envelopeWriter) Marshal(message any) *Error {
 func (w *envelopeWriter) Write(env *envelope) *Error {
 	if env.IsSet(flagEnvelopeCompressed) ||
 		w.compressionPool == nil ||
-		env.Data.Len() < w.compressMinBytes {
-		if w.sendMaxBytes > 0 && env.Data.Len() > w.sendMaxBytes {
-			return errorf(CodeResourceExhausted, "message size %d exceeds sendMaxBytes %d", env.Data.Len(), w.sendMaxBytes)
+		env.data.Len() < w.compressMinBytes {
+		if w.sendMaxBytes > 0 && env.data.Len() > w.sendMaxBytes {
+			return errorf(CodeResourceExhausted, "message size %d exceeds sendMaxBytes %d", env.data.Len(), w.sendMaxBytes)
 		}
 		return w.write(env)
 	}
+	defer env.Release(w.bufferPool)
 	data := w.bufferPool.Get()
 	defer w.bufferPool.Put(data)
-	if err := w.compressionPool.Compress(data, env.Data); err != nil {
+	if err := w.compressionPool.Compress(data, &env.data); err != nil {
 		return err
 	}
 	if w.sendMaxBytes > 0 && data.Len() > w.sendMaxBytes {
 		return errorf(CodeResourceExhausted, "compressed message size %d exceeds sendMaxBytes %d", data.Len(), w.sendMaxBytes)
 	}
-	return w.write(&envelope{
-		Data:  data,
-		Flags: env.Flags | flagEnvelopeCompressed,
-	})
+	return w.write(newEnvelope(env.flags|flagEnvelopeCompressed, data))
 }
 
-func (w *envelopeWriter) marshalAppend(message any, codec marshalAppender) *Error {
-	// Codec supports MarshalAppend; try to re-use a []byte from the pool.
-	buffer := w.bufferPool.Get()
-	defer w.bufferPool.Put(buffer)
+func marshalAppend(message any, codec marshalAppender, bufferPool *bufferPool) (*bytes.Buffer, *Error) {
+	buffer := bufferPool.Get()
 	raw, err := codec.MarshalAppend(buffer.Bytes(), message)
 	if err != nil {
-		return errorf(CodeInternal, "marshal message: %w", err)
+		bufferPool.Put(buffer)
+		return nil, errorf(CodeInternal, "marshal message: %w", err)
 	}
 	if cap(raw) > buffer.Cap() {
 		// The buffer from the pool was too small, so MarshalAppend grew the slice.
@@ -189,21 +260,18 @@ func (w *envelopeWriter) marshalAppend(message any, codec marshalAppender) *Erro
 		// copies but avoids allocating.
 		buffer.Write(raw)
 	}
-	envelope := &envelope{Data: buffer}
-	return w.Write(envelope)
+	return buffer, nil
 }
 
-func (w *envelopeWriter) marshal(message any) *Error {
-	// Codec doesn't support MarshalAppend; let Marshal allocate a []byte.
-	raw, err := w.codec.Marshal(message)
-	if err != nil {
-		return errorf(CodeInternal, "marshal message: %w", err)
+func marshal(message any, codec Codec, bufferPool *bufferPool) (*bytes.Buffer, *Error) {
+	if appender, ok := codec.(marshalAppender); ok {
+		return marshalAppend(message, appender, bufferPool)
 	}
-	buffer := bytes.NewBuffer(raw)
-	// Put our new []byte into the pool for later reuse.
-	defer w.bufferPool.Put(buffer)
-	envelope := &envelope{Data: buffer}
-	return w.Write(envelope)
+	raw, err := codec.Marshal(message)
+	if err != nil {
+		return nil, errorf(CodeInternal, "marshal message: %w", err)
+	}
+	return bytes.NewBuffer(raw), nil
 }
 
 func (w *envelopeWriter) write(env *envelope) *Error {
@@ -230,12 +298,10 @@ func (r *envelopeReader) Unmarshal(message any) *Error {
 	buffer := r.bufferPool.Get()
 	defer r.bufferPool.Put(buffer)
 
-	env := &envelope{Data: buffer}
-	err := r.Read(env)
+	flags, err := r.Read(buffer)
 	switch {
 	case err == nil &&
-		(env.Flags == 0 || env.Flags == flagEnvelopeCompressed) &&
-		env.Data.Len() == 0:
+		(flags == 0 || flags == flagEnvelopeCompressed) && buffer.Len() == 0:
 		// This is a standard message (because none of the top 7 bits are set) and
 		// there's no data, so the zero value of the message is correct.
 		return nil
@@ -247,8 +313,7 @@ func (r *envelopeReader) Unmarshal(message any) *Error {
 		return err
 	}
 
-	data := env.Data
-	if data.Len() > 0 && env.IsSet(flagEnvelopeCompressed) {
+	if buffer.Len() > 0 && flags&flagEnvelopeCompressed > 0 {
 		if r.compressionPool == nil {
 			return errorf(
 				CodeInvalidArgument,
@@ -257,13 +322,12 @@ func (r *envelopeReader) Unmarshal(message any) *Error {
 		}
 		decompressed := r.bufferPool.Get()
 		defer r.bufferPool.Put(decompressed)
-		if err := r.compressionPool.Decompress(decompressed, data, int64(r.readMaxBytes)); err != nil {
+		if err := r.compressionPool.Decompress(decompressed, buffer, int64(r.readMaxBytes)); err != nil {
 			return err
 		}
-		data = decompressed
+		buffer = decompressed
 	}
-
-	if env.Flags != 0 && env.Flags != flagEnvelopeCompressed {
+	if flags != 0 && flags != flagEnvelopeCompressed {
 		// Drain the rest of the stream to ensure there is no extra data.
 		if numBytes, err := discard(r.reader); err != nil {
 			err = wrapIfContextError(err)
@@ -278,22 +342,20 @@ func (r *envelopeReader) Unmarshal(message any) *Error {
 		// stream. Save the message for protocol-specific code to process and
 		// return a sentinel error. Since we've deferred functions to return env's
 		// underlying buffer to a pool, we need to keep a copy.
-		copiedData := make([]byte, data.Len())
-		copy(copiedData, data.Bytes())
 		r.last = envelope{
-			Data:  bytes.NewBuffer(copiedData),
-			Flags: env.Flags,
+			data:  claimBuffer(buffer),
+			flags: flags,
 		}
 		return errSpecialEnvelope
 	}
 
-	if err := r.codec.Unmarshal(data.Bytes(), message); err != nil {
+	if err := r.codec.Unmarshal(buffer.Bytes(), message); err != nil {
 		return errorf(CodeInvalidArgument, "unmarshal message: %w", err)
 	}
 	return nil
 }
 
-func (r *envelopeReader) Read(env *envelope) *Error {
+func (r *envelopeReader) Read(dst *bytes.Buffer) (flags uint8, err *Error) {
 	prefixes := [5]byte{}
 	// io.ReadFull reads the number of bytes requested, or returns an error.
 	// io.EOF will only be returned if no bytes were read.
@@ -302,21 +364,21 @@ func (r *envelopeReader) Read(env *envelope) *Error {
 			// The stream ended cleanly. That's expected, but we need to propagate an EOF
 			// to the user so that they know that the stream has ended. We shouldn't
 			// add any alarming text about protocol errors, though.
-			return NewError(CodeUnknown, err)
+			return 0, NewError(CodeUnknown, err)
 		}
 		err = wrapIfContextError(err)
 		if connectErr, ok := asError(err); ok {
-			return connectErr
+			return 0, connectErr
 		}
 		// Something else has gone wrong - the stream didn't end cleanly.
 		if connectErr, ok := asError(err); ok {
-			return connectErr
+			return 0, connectErr
 		}
 		if maxBytesErr := asMaxBytesError(err, "read 5 byte message prefix"); maxBytesErr != nil {
 			// We're reading from an http.MaxBytesHandler, and we've exceeded the read limit.
-			return maxBytesErr
+			return 0, maxBytesErr
 		}
-		return errorf(
+		return 0, errorf(
 			CodeInvalidArgument,
 			"protocol error: incomplete envelope: %w", err,
 		)
@@ -325,22 +387,22 @@ func (r *envelopeReader) Read(env *envelope) *Error {
 	if r.readMaxBytes > 0 && size > int64(r.readMaxBytes) {
 		_, err := io.CopyN(io.Discard, r.reader, size)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return errorf(CodeResourceExhausted, "message is larger than configured max %d - unable to determine message size: %w", r.readMaxBytes, err)
+			return 0, errorf(CodeResourceExhausted, "message is larger than configured max %d - unable to determine message size: %w", r.readMaxBytes, err)
 		}
-		return errorf(CodeResourceExhausted, "message size %d is larger than configured max %d", size, r.readMaxBytes)
+		return 0, errorf(CodeResourceExhausted, "message size %d is larger than configured max %d", size, r.readMaxBytes)
 	}
 	// We've read the prefix, so we know how many bytes to expect.
 	// CopyN will return an error if it doesn't read the requested
 	// number of bytes.
-	if readN, err := io.CopyN(env.Data, r.reader, size); err != nil {
+	if readN, err := io.CopyN(dst, r.reader, size); err != nil {
 		if maxBytesErr := asMaxBytesError(err, "read %d byte message", size); maxBytesErr != nil {
 			// We're reading from an http.MaxBytesHandler, and we've exceeded the read limit.
-			return maxBytesErr
+			return 0, maxBytesErr
 		}
 		if errors.Is(err, io.EOF) {
 			// We've gotten fewer bytes than we expected, so the stream has ended
 			// unexpectedly.
-			return errorf(
+			return 0, errorf(
 				CodeInvalidArgument,
 				"protocol error: promised %d bytes in enveloped message, got %d bytes",
 				size,
@@ -349,12 +411,11 @@ func (r *envelopeReader) Read(env *envelope) *Error {
 		}
 		err = wrapIfContextError(err)
 		if connectErr, ok := asError(err); ok {
-			return connectErr
+			return 0, connectErr
 		}
-		return errorf(CodeUnknown, "read enveloped message: %w", err)
+		return 0, errorf(CodeUnknown, "read enveloped message: %w", err)
 	}
-	env.Flags = prefixes[0]
-	return nil
+	return prefixes[0], nil
 }
 
 func makeEnvelopePrefix(flags uint8, size int) [5]byte {

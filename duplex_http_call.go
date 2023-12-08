@@ -35,12 +35,13 @@ type duplexHTTPCall struct {
 	streamType       StreamType
 	onRequestSend    func(*http.Request)
 	validateResponse func(*http.Response) *Error
+	bufferPool       *bufferPool
 
 	// We'll use a pipe as the request body. We hand the read side of the pipe to
 	// net/http, and we write to the write side (naturally). The two ends are
 	// safe to use concurrently.
-	requestBodyReader *io.PipeReader
 	requestBodyWriter *io.PipeWriter
+	requestPayloads   []messagePayload
 
 	// requestSent ensures we only send the request once.
 	requestSent atomic.Bool
@@ -60,12 +61,12 @@ func newDuplexHTTPCall(
 	url *url.URL,
 	spec Spec,
 	header http.Header,
+	bufferPool *bufferPool,
 ) *duplexHTTPCall {
 	// ensure we make a copy of the url before we pass along to the
 	// Request. This ensures if a transport out of our control wants
 	// to mutate the req.URL, we don't feel the effects of it.
 	url = cloneURL(url)
-	pipeReader, pipeWriter := io.Pipe()
 
 	// This is mirroring what http.NewRequestContext did, but
 	// using an already parsed url.URL object, rather than a string
@@ -74,30 +75,73 @@ func newDuplexHTTPCall(
 	// NewRequestContext and doesn't effect the actual version
 	// being transmitted.
 	request := (&http.Request{
-		Method:     http.MethodPost,
-		URL:        url,
-		Header:     header,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Body:       pipeReader,
-		Host:       url.Host,
+		Method:        http.MethodPost,
+		URL:           url,
+		Header:        header,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Body:          http.NoBody,
+		ContentLength: 0,
+		Host:          url.Host,
 	}).WithContext(ctx)
 	return &duplexHTTPCall{
-		ctx:               ctx,
-		httpClient:        httpClient,
-		streamType:        spec.StreamType,
-		requestBodyReader: pipeReader,
-		requestBodyWriter: pipeWriter,
-		request:           request,
-		responseReady:     make(chan struct{}),
+		ctx:           ctx,
+		httpClient:    httpClient,
+		streamType:    spec.StreamType,
+		request:       request,
+		responseReady: make(chan struct{}),
+		bufferPool:    bufferPool,
 	}
 }
 
+func (d *duplexHTTPCall) sendUnary(payload messagePayload) (int64, error) {
+	// Unary messages are sent as a single HTTP request. We don't need to use a
+	// pipe for the request body.
+	if !d.requestSent.CompareAndSwap(false, true) {
+		return 0, fmt.Errorf("unary message already sent")
+	}
+	payloadLength := int64(payload.Len())
+	if payloadLength > 0 {
+		payloadBody := io.NopCloser(payload)
+		d.request.Body = payloadBody
+		d.request.ContentLength = payloadLength
+		d.request.GetBody = func() (io.ReadCloser, error) {
+			if _, err := payload.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
+			return payloadBody, nil
+		}
+		d.requestPayloads = append(d.requestPayloads, payload)
+	}
+	d.makeRequest()
+	if err := d.ctx.Err(); err != nil {
+		return 0, wrapIfContextError(err)
+	}
+	return payloadLength, nil
+}
+
 // Send sends a message to the server.
-func (d *duplexHTTPCall) Send(payload messsagePayload) (int64, error) {
-	isFirst := d.ensureRequestMade()
-	// Before we send any data, check if the context has been canceled.
+func (d *duplexHTTPCall) Send(payload messagePayload) (int64, error) {
+	if d.streamType&StreamTypeClient == 0 {
+		return d.sendUnary(payload)
+	}
+	defer payload.Release(d.bufferPool)
+	isFirst := d.requestSent.CompareAndSwap(false, true)
+	if isFirst {
+		// This is the first time we're sending a message to the server.
+		// We need to send the request headers and start the request.
+		pipeReader, pipeWriter := io.Pipe()
+		d.requestBodyWriter = pipeWriter
+		d.request.Body = pipeReader
+		d.request.ContentLength = -1
+		if d.streamType&StreamTypeClient == 0 {
+			// If the client is not streaming, the first payload size is
+			// the Content-Length.
+			d.request.ContentLength = int64(payload.Len())
+		}
+		go d.makeRequest() // concurrent request
+	}
 	if err := d.ctx.Err(); err != nil {
 		return 0, wrapIfContextError(err)
 	}
@@ -113,7 +157,7 @@ func (d *duplexHTTPCall) Send(payload messsagePayload) (int64, error) {
 		// Signal that the stream is closed with the more-typical io.EOF instead of
 		// io.ErrClosedPipe. This makes it easier for protocol-specific wrappers to
 		// match grpc-go's behavior.
-		return bytesWritten, io.EOF
+		err = io.EOF
 	}
 	return bytesWritten, err
 }
@@ -124,7 +168,10 @@ func (d *duplexHTTPCall) CloseWrite() error {
 	// Even if Write was never called, we need to make an HTTP request. This
 	// ensures that we've sent any headers to the server and that we have an HTTP
 	// response to read from.
-	d.ensureRequestMade()
+	if d.requestSent.CompareAndSwap(false, true) {
+		go d.makeRequest()
+		return nil
+	}
 	// The user calls CloseWrite to indicate that they're done sending data. It's
 	// safe to close the write side of the pipe while net/http is reading from
 	// it.
@@ -136,7 +183,10 @@ func (d *duplexHTTPCall) CloseWrite() error {
 	// forever. To make sure users don't have to worry about this, the generated
 	// code for unary, client streaming, and server streaming RPCs must call
 	// CloseWrite automatically rather than requiring the user to do it.
-	return d.requestBodyWriter.Close()
+	if d.requestBodyWriter != nil {
+		return d.requestBodyWriter.Close()
+	}
+	return d.request.Body.Close()
 }
 
 // Header returns the HTTP request headers.
@@ -190,6 +240,10 @@ func (d *duplexHTTPCall) CloseRead() error {
 		errors.Is(err, context.DeadlineExceeded) {
 		err = closeErr
 	}
+	for _, payload := range d.requestPayloads {
+		payload.Release(d.bufferPool)
+	}
+	d.requestPayloads = nil
 	err = wrapIfContextError(err)
 	return wrapIfRSTError(err)
 }
@@ -233,17 +287,6 @@ func (d *duplexHTTPCall) BlockUntilResponseReady() error {
 	return d.responseErr
 }
 
-// ensureRequestMade sends the request headers and starts the response stream.
-// It is not safe to call this concurrently. Write and CloseWrite call this but
-// ensure that they're not called concurrently.
-func (d *duplexHTTPCall) ensureRequestMade() (isFirst bool) {
-	if d.requestSent.CompareAndSwap(false, true) {
-		go d.makeRequest()
-		return true
-	}
-	return false
-}
-
 func (d *duplexHTTPCall) makeRequest() {
 	// This runs concurrently with Write and CloseWrite. Read and CloseRead wait
 	// on d.responseReady, so we can't race with them.
@@ -272,7 +315,7 @@ func (d *duplexHTTPCall) makeRequest() {
 			err = NewError(CodeUnavailable, err)
 		}
 		d.responseErr = err
-		d.requestBodyWriter.Close()
+		_ = d.CloseWrite()
 		return
 	}
 	// We've got a response. We can now read from the response body.
@@ -280,7 +323,7 @@ func (d *duplexHTTPCall) makeRequest() {
 	d.response = response
 	if err := d.validateResponse(response); err != nil {
 		d.responseErr = err
-		d.requestBodyWriter.Close()
+		_ = d.CloseWrite()
 		return
 	}
 	if (d.streamType&StreamTypeBidi) == StreamTypeBidi && response.ProtoMajor < 2 {
@@ -293,24 +336,25 @@ func (d *duplexHTTPCall) makeRequest() {
 			response.ProtoMajor,
 			response.ProtoMinor,
 		)
-		d.requestBodyWriter.Close()
+		_ = d.CloseWrite()
 	}
 }
 
-// messsagePayload is a sized and seekable message payload. The interface is
-// implemented by [*bytes.Reader] and *envelope.
-type messsagePayload interface {
+// messagePayload is a sized and seekable message payload. The interface is
+// implemented by *payload and *envelope.
+type messagePayload interface {
 	io.Reader
 	io.WriterTo
 	io.Seeker
 	Len() int
+	Release(*bufferPool)
 }
 
 // nopPayload is a message payload that does nothing. It's used to send headers
 // to the server.
 type nopPayload struct{}
 
-var _ messsagePayload = nopPayload{}
+var _ messagePayload = nopPayload{}
 
 func (nopPayload) Read([]byte) (int, error) {
 	return 0, io.EOF
@@ -324,22 +368,34 @@ func (nopPayload) Seek(int64, int) (int64, error) {
 func (nopPayload) Len() int {
 	return 0
 }
+func (nopPayload) Release(*bufferPool) {}
 
 // messageSender sends a message payload. The interface is implemented by
 // [*duplexHTTPCall] and writeSender.
 type messageSender interface {
-	Send(messsagePayload) (int64, error)
+	// Send sends a message payload. The function takes ownership of the payload
+	// and is responsible for releasing it.
+	Send(messagePayload) (int64, error)
 }
 
 // writeSender is a sender that writes to an [io.Writer]. Useful for wrapping
 // [http.ResponseWriter].
 type writeSender struct {
-	writer io.Writer
+	writer     io.Writer
+	bufferPool *bufferPool
 }
 
-var _ messageSender = writeSender{}
+func newWriteSender(writer io.Writer, bufferPool *bufferPool) *writeSender {
+	return &writeSender{
+		writer:     writer,
+		bufferPool: bufferPool,
+	}
+}
 
-func (w writeSender) Send(payload messsagePayload) (int64, error) {
+var _ messageSender = (*writeSender)(nil)
+
+func (w *writeSender) Send(payload messagePayload) (int64, error) {
+	defer payload.Release(w.bufferPool)
 	return payload.WriteTo(w.writer)
 }
 

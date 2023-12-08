@@ -254,7 +254,7 @@ func (h *connectHandler) NewConn(
 			request:        request,
 			responseWriter: responseWriter,
 			marshaler: connectUnaryMarshaler{
-				sender:           writeSender{writer: responseWriter},
+				sender:           newWriteSender(responseWriter, h.BufferPool),
 				codec:            codec,
 				compressMinBytes: h.CompressMinBytes,
 				compressionName:  responseCompression,
@@ -280,7 +280,7 @@ func (h *connectHandler) NewConn(
 			responseWriter: responseWriter,
 			marshaler: connectStreamingMarshaler{
 				envelopeWriter: envelopeWriter{
-					sender:           writeSender{responseWriter},
+					sender:           newWriteSender(responseWriter, h.BufferPool),
 					codec:            codec,
 					compressMinBytes: h.CompressMinBytes,
 					compressionPool:  h.CompressionPools.Get(responseCompression),
@@ -364,7 +364,14 @@ func (c *connectClient) NewConn(
 			} // else effectively unbounded
 		}
 	}
-	duplexCall := newDuplexHTTPCall(ctx, c.HTTPClient, c.URL, spec, header)
+	duplexCall := newDuplexHTTPCall(
+		ctx,
+		c.HTTPClient,
+		c.URL,
+		spec,
+		header,
+		c.BufferPool,
+	)
 	var conn streamingClientConn
 	if spec.StreamType == StreamTypeUnary {
 		unaryConn := &connectUnaryClientConn{
@@ -841,10 +848,9 @@ func (m *connectStreamingMarshaler) MarshalEndStream(err error, trailer http.Hea
 		return errorf(CodeInternal, "marshal end stream: %w", marshalErr)
 	}
 	raw := bytes.NewBuffer(data)
-	defer m.envelopeWriter.bufferPool.Put(raw)
 	return m.Write(&envelope{
-		Data:  raw,
-		Flags: connectFlagEnvelopeEndStream,
+		data:  claimBuffer(raw),
+		flags: connectFlagEnvelopeEndStream,
 	})
 }
 
@@ -865,10 +871,10 @@ func (u *connectStreamingUnmarshaler) Unmarshal(message any) *Error {
 	}
 	env := u.envelopeReader.last
 	if !env.IsSet(connectFlagEnvelopeEndStream) {
-		return errorf(CodeInternal, "protocol error: invalid envelope flags %d", env.Flags)
+		return errorf(CodeInternal, "protocol error: invalid envelope flags %d", env.flags)
 	}
 	var end connectEndStreamMessage
-	if err := json.Unmarshal(env.Data.Bytes(), &end); err != nil {
+	if err := json.Unmarshal(env.data.Bytes(), &end); err != nil {
 		return errorf(CodeInternal, "unmarshal end stream message: %w", err)
 	}
 	for name, value := range end.Trailer {
@@ -906,40 +912,38 @@ func (m *connectUnaryMarshaler) Marshal(message any) *Error {
 	if message == nil {
 		return m.write(nil)
 	}
-	var data []byte
-	var err error
-	if appender, ok := m.codec.(marshalAppender); ok {
-		data, err = appender.MarshalAppend(m.bufferPool.Get().Bytes(), message)
-	} else {
-		// Can't avoid allocating the slice, but we'll reuse it.
-		data, err = m.codec.Marshal(message)
-	}
+	data, err := marshal(message, m.codec, m.bufferPool)
 	if err != nil {
-		return errorf(CodeInternal, "marshal message: %w", err)
+		return err
 	}
-	uncompressed := bytes.NewBuffer(data)
-	defer m.bufferPool.Put(uncompressed)
-	if len(data) < m.compressMinBytes || m.compressionPool == nil {
-		if m.sendMaxBytes > 0 && len(data) > m.sendMaxBytes {
-			return NewError(CodeResourceExhausted, fmt.Errorf("message size %d exceeds sendMaxBytes %d", len(data), m.sendMaxBytes))
+	defer m.bufferPool.Put(data)
+	if data.Len() < m.compressMinBytes || m.compressionPool == nil {
+		if m.sendMaxBytes > 0 && data.Len() > m.sendMaxBytes {
+			return NewError(CodeResourceExhausted, fmt.Errorf("message size %d exceeds sendMaxBytes %d", data.Len(), m.sendMaxBytes))
+		}
+		return m.write(data)
+	}
+	if data.Len() < m.compressMinBytes || m.compressionPool == nil {
+		if m.sendMaxBytes > 0 && data.Len() > m.sendMaxBytes {
+			return NewError(CodeResourceExhausted, fmt.Errorf("message size %d exceeds sendMaxBytes %d", data.Len(), m.sendMaxBytes))
 		}
 		return m.write(data)
 	}
 	compressed := m.bufferPool.Get()
 	defer m.bufferPool.Put(compressed)
-	if err := m.compressionPool.Compress(compressed, uncompressed); err != nil {
+	if err := m.compressionPool.Compress(compressed, data); err != nil {
 		return err
 	}
 	if m.sendMaxBytes > 0 && compressed.Len() > m.sendMaxBytes {
 		return NewError(CodeResourceExhausted, fmt.Errorf("compressed message size %d exceeds sendMaxBytes %d", compressed.Len(), m.sendMaxBytes))
 	}
 	setHeaderCanonical(m.header, connectUnaryHeaderCompression, m.compressionName)
-	return m.write(compressed.Bytes())
+	return m.write(compressed)
 }
 
-func (m *connectUnaryMarshaler) write(data []byte) *Error {
-	payload := bytes.NewReader(data)
-	if _, err := m.sender.Send(payload); err != nil {
+func (m *connectUnaryMarshaler) write(data *bytes.Buffer) *Error {
+	msgPayload := newPayload(data)
+	if _, err := m.sender.Send(msgPayload); err != nil {
 		err = wrapIfContextError(err)
 		if connectErr, ok := asError(err); ok {
 			return connectErr
@@ -997,7 +1001,7 @@ func (m *connectUnaryRequestMarshaler) marshalWithGet(message any) *Error {
 		}
 		if m.compressionPool == nil {
 			if m.getUseFallback {
-				return m.write(data)
+				return m.write(bytes.NewBuffer(data))
 			}
 			return NewError(CodeResourceExhausted, fmt.Errorf(
 				"url size %d exceeds getURLMaxBytes %d: enabling request compression may help",
@@ -1023,7 +1027,7 @@ func (m *connectUnaryRequestMarshaler) marshalWithGet(message any) *Error {
 	}
 	if m.getUseFallback {
 		setHeaderCanonical(m.header, connectUnaryHeaderCompression, m.compressionName)
-		return m.write(compressed.Bytes())
+		return m.write(compressed)
 	}
 	return NewError(CodeResourceExhausted, fmt.Errorf("compressed url size %d exceeds getURLMaxBytes %d", len(url.String()), m.getURLMaxBytes))
 }

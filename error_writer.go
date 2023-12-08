@@ -133,7 +133,7 @@ func (w *ErrorWriter) writeConnectStreaming(response http.ResponseWriter, err er
 	response.WriteHeader(http.StatusOK)
 	marshaler := &connectStreamingMarshaler{
 		envelopeWriter: envelopeWriter{
-			sender:     writeSender{writer: response},
+			sender:     newWriteSender(response, w.bufferPool),
 			bufferPool: w.bufferPool,
 		},
 	}

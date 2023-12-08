@@ -72,13 +72,11 @@ func TestConnectEndOfResponseCanonicalTrailers(t *testing.T) {
 	assert.Nil(t, err)
 
 	writer := envelopeWriter{
-		sender:     writeSender{writer: &buffer},
+		sender:     newWriteSender(&buffer, bufferPool),
 		bufferPool: bufferPool,
 	}
-	err = writer.Write(&envelope{
-		Flags: connectFlagEnvelopeEndStream,
-		Data:  bytes.NewBuffer(endStreamData),
-	})
+	env := newEnvelope(connectFlagEnvelopeEndStream, bytes.NewBuffer(endStreamData))
+	err = writer.Write(env)
 	assert.Nil(t, err)
 
 	unmarshaler := connectStreamingUnmarshaler{

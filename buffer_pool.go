@@ -46,9 +46,18 @@ func (b *bufferPool) Get() *bytes.Buffer {
 }
 
 func (b *bufferPool) Put(buffer *bytes.Buffer) {
-	if buffer.Cap() > maxRecycleBufferSize {
+	if buffer.Cap() < initialBufferSize || buffer.Cap() > maxRecycleBufferSize {
 		return
 	}
 	buffer.Reset()
 	b.Pool.Put(buffer)
+}
+
+// claimBuffer returns the contents of the buffer and zeros the given buffer.
+// This takes ownership of the buffer and the caller is responsible for
+// returning the buffer conntents to the pool.
+func claimBuffer(buffer *bytes.Buffer) bytes.Buffer {
+	bufferContents := *buffer
+	*buffer = bytes.Buffer{}
+	return bufferContents
 }

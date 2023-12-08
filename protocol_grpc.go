@@ -186,7 +186,7 @@ func (g *grpcHandler) NewConn(
 		protobuf:   g.Codecs.Protobuf(), // for errors
 		marshaler: grpcMarshaler{
 			envelopeWriter: envelopeWriter{
-				sender:           writeSender{writer: responseWriter},
+				sender:           newWriteSender(responseWriter, g.BufferPool),
 				compressionPool:  g.CompressionPools.Get(responseCompression),
 				codec:            codec,
 				compressMinBytes: g.CompressMinBytes,
@@ -274,6 +274,7 @@ func (g *grpcClient) NewConn(
 		g.URL,
 		spec,
 		header,
+		g.BufferPool,
 	)
 	conn := &grpcClientConn{
 		spec:             spec,
@@ -595,10 +596,7 @@ func (m *grpcMarshaler) MarshalWebTrailers(trailer http.Header) *Error {
 	if err := trailer.Write(raw); err != nil {
 		return errorf(CodeInternal, "format trailers: %w", err)
 	}
-	return m.Write(&envelope{
-		Data:  raw,
-		Flags: grpcFlagEnvelopeTrailer,
-	})
+	return m.Write(newEnvelope(grpcFlagEnvelopeTrailer, raw))
 }
 
 type grpcUnmarshaler struct {
@@ -617,16 +615,16 @@ func (u *grpcUnmarshaler) Unmarshal(message any) *Error {
 	}
 	env := u.envelopeReader.last
 	if !u.web || !env.IsSet(grpcFlagEnvelopeTrailer) {
-		return errorf(CodeInternal, "protocol error: invalid envelope flags %d", env.Flags)
+		return errorf(CodeInternal, "protocol error: invalid envelope flags %d", env.flags)
 	}
 
 	// Per the gRPC-Web specification, trailers should be encoded as an HTTP/1
 	// headers block _without_ the terminating newline. To make the headers
 	// parseable by net/textproto, we need to add the newline.
-	if err := env.Data.WriteByte('\n'); err != nil {
+	if err := env.data.WriteByte('\n'); err != nil {
 		return errorf(CodeInternal, "unmarshal web trailers: %w", err)
 	}
-	bufferedReader := bufio.NewReader(env.Data)
+	bufferedReader := bufio.NewReader(&env.data)
 	mimeReader := textproto.NewReader(bufferedReader)
 	mimeHeader, mimeErr := mimeReader.ReadMIMEHeader()
 	if mimeErr != nil {

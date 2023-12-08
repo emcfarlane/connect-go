@@ -24,6 +24,7 @@ import (
 
 func TestEnvelope(t *testing.T) {
 	t.Parallel()
+	bufferPool := newBufferPool()
 	payload := []byte(`{"number": 42}`)
 	head := makeEnvelopePrefix(0, len(payload))
 	buf := &bytes.Buffer{}
@@ -33,23 +34,27 @@ func TestEnvelope(t *testing.T) {
 		t.Parallel()
 		t.Run("full", func(t *testing.T) {
 			t.Parallel()
-			env := &envelope{Data: &bytes.Buffer{}}
+			dst := &bytes.Buffer{}
 			rdr := envelopeReader{
 				reader: bytes.NewReader(buf.Bytes()),
 			}
-			assert.Nil(t, rdr.Read(env))
-			assert.Equal(t, payload, env.Data.Bytes())
+			flags, err := rdr.Read(dst)
+			assert.Nil(t, err)
+			assert.Equal(t, uint8(0), flags)
+			assert.Equal(t, payload, dst.Bytes())
 		})
 		t.Run("byteByByte", func(t *testing.T) {
 			t.Parallel()
-			env := &envelope{Data: &bytes.Buffer{}}
+			dst := &bytes.Buffer{}
 			rdr := envelopeReader{
 				reader: byteByByteReader{
 					reader: bytes.NewReader(buf.Bytes()),
 				},
 			}
-			assert.Nil(t, rdr.Read(env))
-			assert.Equal(t, payload, env.Data.Bytes())
+			flags, err := rdr.Read(dst)
+			assert.Nil(t, err)
+			assert.Equal(t, uint8(0), flags)
+			assert.Equal(t, payload, dst.Bytes())
 		})
 	})
 	t.Run("write", func(t *testing.T) {
@@ -58,9 +63,9 @@ func TestEnvelope(t *testing.T) {
 			t.Parallel()
 			dst := &bytes.Buffer{}
 			wtr := envelopeWriter{
-				sender: writeSender{writer: dst},
+				sender: newWriteSender(dst, bufferPool),
 			}
-			env := &envelope{Data: bytes.NewBuffer(payload)}
+			env := newEnvelope(0, bytes.NewBuffer(payload))
 			err := wtr.Write(env)
 			assert.Nil(t, err)
 			assert.Equal(t, buf.Bytes(), dst.Bytes())
@@ -68,7 +73,7 @@ func TestEnvelope(t *testing.T) {
 		t.Run("partial", func(t *testing.T) {
 			t.Parallel()
 			dst := &bytes.Buffer{}
-			env := &envelope{Data: bytes.NewBuffer(payload)}
+			env := newEnvelope(0, bytes.NewBuffer(payload))
 			_, err := io.CopyN(dst, env, 2)
 			assert.Nil(t, err)
 			_, err = env.WriteTo(dst)
@@ -82,7 +87,7 @@ func TestEnvelope(t *testing.T) {
 			t.Parallel()
 			dst1 := &bytes.Buffer{}
 			dst2 := &bytes.Buffer{}
-			env := &envelope{Data: bytes.NewBuffer(payload)}
+			env := newEnvelope(0, bytes.NewBuffer(payload))
 			_, err := io.CopyN(dst1, env, 2)
 			assert.Nil(t, err)
 			assert.Equal(t, env.Len(), len(payload)+3)
