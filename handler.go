@@ -282,6 +282,7 @@ type handlerConfig struct {
 	ReadMaxBytes                 int
 	SendMaxBytes                 int
 	StreamType                   StreamType
+	Observability                maybeObservability
 }
 
 func newHandlerConfig(procedure string, streamType StreamType, options []HandlerOption) *handlerConfig {
@@ -338,6 +339,7 @@ func (c *handlerConfig) newProtocolHandlers() []protocolHandler {
 			SendMaxBytes:                 c.SendMaxBytes,
 			RequireConnectProtocolHeader: c.RequireConnectProtocolHeader,
 			IdempotencyLevel:             c.IdempotencyLevel,
+			Observability:                c.Observability,
 		}))
 	}
 	return handlers

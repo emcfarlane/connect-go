@@ -46,6 +46,7 @@ func NewClient[Req, Res any](httpClient HTTPClient, url string, options ...Clien
 		client.err = err
 		return client
 	}
+	//config.Observability.maybe()
 	client.config = config
 	protocolClient, protocolErr := client.config.Protocol.NewClient(
 		&protocolClientParams{
@@ -65,6 +66,7 @@ func NewClient[Req, Res any](httpClient HTTPClient, url string, options ...Clien
 			EnableGet:        config.EnableGet,
 			GetURLMaxBytes:   config.GetURLMaxBytes,
 			GetUseFallback:   config.GetUseFallback,
+			Observability:    config.Observability,
 		},
 	)
 	if protocolErr != nil {
@@ -213,6 +215,7 @@ type clientConfig struct {
 	GetURLMaxBytes         int
 	GetUseFallback         bool
 	IdempotencyLevel       IdempotencyLevel
+	Observability          maybeObservability
 }
 
 func newClientConfig(rawURL string, options []ClientOption) (*clientConfig, *Error) {

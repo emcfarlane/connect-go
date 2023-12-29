@@ -351,6 +351,40 @@ func WithInterceptors(interceptors ...Interceptor) Option {
 	return &interceptorsOption{interceptors}
 }
 
+// WithObservability provides a function that may return an [Observer] to
+// observe events during the execution of an RPC. For example, an Observer may
+// be used to emit metrics, trace or log events. The observability function may
+// modify the context or header metadata to propagate information required by
+// other Observers. A nil Observer disables observability for the current
+// request.
+func WithObservability(observability func(context.Context, Spec, Peer, http.Header) (context.Context, Observer)) Option {
+	return &observabilityOption{observability}
+}
+
+type observabilityOption struct {
+	observability func(context.Context, Spec, Peer, http.Header) (context.Context, Observer)
+}
+
+func (o *observabilityOption) applyToClient(config *clientConfig) {
+	config.Observability.observability = o.observability
+}
+
+func (o *observabilityOption) applyToHandler(config *handlerConfig) {
+	config.Observability.observability = o.observability
+}
+
+type maybeObservability struct {
+	observability func(context.Context, Spec, Peer, http.Header) (context.Context, Observer)
+}
+
+func (o maybeObservability) maybe(ctx context.Context, spec Spec, peer Peer, header http.Header) (context.Context, maybeObserver) {
+	var observer Observer
+	if o.observability != nil {
+		ctx, observer = o.observability(ctx, spec, peer, header)
+	}
+	return ctx, maybeObserver{observer: observer}
+}
+
 // WithOptions composes multiple Options into one.
 func WithOptions(options ...Option) Option {
 	return &optionsOption{options}
