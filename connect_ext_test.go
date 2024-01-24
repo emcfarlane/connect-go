@@ -1494,6 +1494,86 @@ func TestClientWithSendMaxBytes(t *testing.T) {
 	})
 }
 
+type testHTTPClientFunc func(*http.Request) (*http.Response, error)
+
+func (f testHTTPClientFunc) Do(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestWithHTTPMiddleware(t *testing.T) {
+	t.Parallel()
+	type testKey struct{}
+	const testHeaderKey = "X-Test"
+	const testValue = "test-value"
+	clientBeforeMiddleware := func(next connect.HTTPClient) connect.HTTPClient {
+		return testHTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+			value := req.Header.Get(testHeaderKey)
+			assert.Equal(t, value, "") // not set yet
+			return next.Do(req)
+		})
+	}
+	clientMiddleware := func(next connect.HTTPClient) connect.HTTPClient {
+		return testHTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+			value, ok := req.Context().Value(testKey{}).(string)
+			if !ok {
+				return nil, errors.New("missing test value")
+			}
+			assert.Equal(t, value, testValue)
+			req.Header.Set(testHeaderKey, value)
+			return next.Do(req)
+		})
+	}
+	clientAfterMiddleware := func(next connect.HTTPClient) connect.HTTPClient {
+		return testHTTPClientFunc(func(req *http.Request) (*http.Response, error) {
+			value := req.Header.Get(testHeaderKey)
+			assert.Equal(t, value, testValue)
+			return next.Do(req)
+		})
+	}
+	handlerBeforeMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, ok := r.Context().Value(testKey{}).(string)
+			assert.False(t, ok) // not set yet
+			next.ServeHTTP(w, r)
+		})
+	}
+	handlerMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			value := r.Header.Get(testHeaderKey)
+			assert.Equal(t, value, testValue)
+			r = r.WithContext(context.WithValue(r.Context(), testKey{}, testValue))
+			next.ServeHTTP(w, r)
+		})
+	}
+	handlerAfterMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			value, ok := r.Context().Value(testKey{}).(string)
+			assert.True(t, ok, assert.Sprintf("test value not set in context"))
+			assert.Equal(t, value, testValue)
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle(pingv1connect.NewPingServiceHandler(pingServer{},
+		connect.WithHTTPHandler(handlerBeforeMiddleware),
+		connect.WithHTTPHandler(handlerMiddleware),
+		connect.WithHTTPHandler(handlerAfterMiddleware),
+	))
+	server := memhttptest.NewServer(t, mux)
+	client := pingv1connect.NewPingServiceClient(
+		server.Client(), server.URL(),
+		connect.WithHTTPClient(clientBeforeMiddleware),
+		connect.WithHTTPClient(clientMiddleware),
+		connect.WithHTTPClient(clientAfterMiddleware),
+	)
+
+	pingRequest := &pingv1.PingRequest{Text: "hello!"}
+	ctx := context.WithValue(context.Background(), testKey{}, testValue)
+	_, err := client.Ping(ctx, connect.NewRequest(pingRequest))
+	assert.Nil(t, err)
+}
+
 func TestBidiStreamServerSendsFirstMessage(t *testing.T) {
 	t.Parallel()
 	run := func(t *testing.T, opts ...connect.ClientOption) {
