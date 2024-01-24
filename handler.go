@@ -32,6 +32,7 @@ type Handler struct {
 	protocolHandlers map[string][]protocolHandler // Method to protocol handlers
 	allowMethod      string                       // Allow header
 	acceptPost       string                       // Accept-Post header
+	handler          http.Handler
 }
 
 // NewUnaryHandler constructs a [Handler] for a request-response procedure.
@@ -91,13 +92,19 @@ func NewUnaryHandler[Req, Res any](
 	}
 
 	protocolHandlers := config.newProtocolHandlers()
-	return &Handler{
+	handler := &Handler{
 		spec:             config.newSpec(),
 		implementation:   implementation,
 		protocolHandlers: mappedMethodHandlers(protocolHandlers),
 		allowMethod:      sortedAllowMethodValue(protocolHandlers),
 		acceptPost:       sortedAcceptPostValue(protocolHandlers),
 	}
+	handler.handler = http.HandlerFunc(handler.serveHTTP)
+	if middleware := config.HTTPHandlerMiddleware; middleware != nil {
+		errorWriter := newErrorWriter(config)
+		handler.handler = middleware(handler.handler, errorWriter)
+	}
+	return handler
 }
 
 // NewClientStreamHandler constructs a [Handler] for a client streaming procedure.
@@ -185,6 +192,10 @@ func NewBidiStreamHandler[Req, Res any](
 
 // ServeHTTP implements [http.Handler].
 func (h *Handler) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
+	h.handler.ServeHTTP(responseWriter, request)
+}
+
+func (h *Handler) serveHTTP(responseWriter http.ResponseWriter, request *http.Request) {
 	// We don't need to defer functions to close the request body or read to
 	// EOF: the stream we construct later on already does that, and we only
 	// return early when dealing with misbehaving clients. In those cases, it's
@@ -282,6 +293,7 @@ type handlerConfig struct {
 	ReadMaxBytes                 int
 	SendMaxBytes                 int
 	StreamType                   StreamType
+	HTTPHandlerMiddleware        func(http.Handler, *ErrorWriter) http.Handler
 }
 
 func newHandlerConfig(procedure string, streamType StreamType, options []HandlerOption) *handlerConfig {
@@ -351,11 +363,17 @@ func newStreamHandler(
 		implementation = ic.WrapStreamingHandler(implementation)
 	}
 	protocolHandlers := config.newProtocolHandlers()
-	return &Handler{
+	handler := &Handler{
 		spec:             config.newSpec(),
 		implementation:   implementation,
 		protocolHandlers: mappedMethodHandlers(protocolHandlers),
 		allowMethod:      sortedAllowMethodValue(protocolHandlers),
 		acceptPost:       sortedAcceptPostValue(protocolHandlers),
 	}
+	handler.handler = http.HandlerFunc(handler.serveHTTP)
+	if middleware := config.HTTPHandlerMiddleware; middleware != nil {
+		errorWriter := newErrorWriter(config)
+		handler.handler = middleware(handler.handler, errorWriter)
+	}
+	return handler
 }

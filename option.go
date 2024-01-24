@@ -100,6 +100,14 @@ func WithSendGzip() ClientOption {
 	return WithSendCompression(compressionGzip)
 }
 
+// WithHTTPClient wraps a client's HTTP client. It's useful for adding
+// middleware like authentication, logging, or metrics. The supplied middleware
+// is applied to the client's HTTP client, so it can inspect and modify
+// requests and responses.
+func WithHTTPClient(middleware func(next HTTPClient) HTTPClient) ClientOption {
+	return &httpClientOption{middleware: middleware}
+}
+
 // A HandlerOption configures a [Handler].
 //
 // In addition to any options grouped in the documentation below, remember that
@@ -175,6 +183,24 @@ func WithRequireConnectProtocolHeader() HandlerOption {
 // slice is safe.
 func WithConditionalHandlerOptions(conditional func(spec Spec) []HandlerOption) HandlerOption {
 	return &conditionalHandlerOptions{conditional: conditional}
+}
+
+type HTTPErrHandler func(http.ResponseWriter, *http.Request) error
+
+func (h HTTPErrHandler) convert(errorWriter *ErrorWriter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := h(w, r); err != nil {
+			errorWriter.Write(w, r, err)
+		}
+	})
+}
+
+// WithHTTPHandler wraps a handler's HTTP handler. It's useful for adding
+// middleware like authentication, logging, or metrics. The supplied middleware
+// is applied to the handler's HTTP handler, so it can inspect and modify
+// requests and responses.
+func WithHTTPHandler(middleware func(next http.Handler) HTTPErrHandler) HandlerOption {
+	return &httpHandlerOption{middleware: middleware}
 }
 
 // Option implements both [ClientOption] and [HandlerOption], so it can be
@@ -643,5 +669,41 @@ func (o *conditionalHandlerOptions) applyToHandler(config *handlerConfig) {
 	}
 	for _, option := range o.conditional(spec) {
 		option.applyToHandler(config)
+	}
+}
+
+type httpClientOption struct {
+	middleware func(next HTTPClient) HTTPClient
+}
+
+func (o *httpClientOption) applyToClient(config *clientConfig) {
+	config.HTTPClientMiddleware = o.chain(config.HTTPClientMiddleware)
+}
+
+func (o *httpClientOption) chain(current func(HTTPClient) HTTPClient) func(HTTPClient) HTTPClient {
+	if current == nil {
+		return o.middleware
+	}
+	return func(next HTTPClient) HTTPClient {
+		return o.middleware(current(next))
+	}
+}
+
+type httpHandlerOption struct {
+	middleware func(next http.Handler) HTTPErrHandler
+}
+
+func (o *httpHandlerOption) applyToHandler(config *handlerConfig) {
+	config.HTTPHandlerMiddleware = o.chain(config.HTTPHandlerMiddleware)
+}
+
+func (o *httpHandlerOption) chain(current func(http.Handler, *ErrorWriter) http.Handler) func(http.Handler, *ErrorWriter) http.Handler {
+	if current == nil {
+		return func(next http.Handler, errorWriter *ErrorWriter) http.Handler {
+			return o.middleware(next).convert(errorWriter)
+		}
+	}
+	return func(next http.Handler, errorWriter *ErrorWriter) http.Handler {
+		return o.middleware(current(next, errorWriter)).convert(errorWriter)
 	}
 }

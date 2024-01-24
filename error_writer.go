@@ -53,6 +53,10 @@ type ErrorWriter struct {
 // Options supplied via [WithConditionalHandlerOptions] are ignored.
 func NewErrorWriter(opts ...HandlerOption) *ErrorWriter {
 	config := newHandlerConfig("", StreamTypeUnary, opts)
+	return newErrorWriter(config)
+}
+
+func newErrorWriter(config *handlerConfig) *ErrorWriter {
 	writer := &ErrorWriter{
 		bufferPool:                   config.BufferPool,
 		protobuf:                     newReadOnlyCodecs(config.Codecs).Protobuf(),

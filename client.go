@@ -46,6 +46,9 @@ func NewClient[Req, Res any](httpClient HTTPClient, url string, options ...Clien
 		client.err = err
 		return client
 	}
+	if middleware := config.HTTPClientMiddleware; middleware != nil {
+		httpClient = middleware(httpClient)
+	}
 	client.config = config
 	protocolClient, protocolErr := client.config.Protocol.NewClient(
 		&protocolClientParams{
@@ -213,6 +216,7 @@ type clientConfig struct {
 	GetURLMaxBytes         int
 	GetUseFallback         bool
 	IdempotencyLevel       IdempotencyLevel
+	HTTPClientMiddleware   func(HTTPClient) HTTPClient
 }
 
 func newClientConfig(rawURL string, options []ClientOption) (*clientConfig, *Error) {
