@@ -385,3 +385,10 @@ func receiveUnaryResponse[T any](conn StreamingClientConn, initializer maybeInit
 		trailer: conn.ResponseTrailer(),
 	}, nil
 }
+
+// Context for RPCs.
+type Context struct {
+	Spec Spec
+}
+
+type ContextKey struct{}

@@ -191,6 +191,10 @@ func NewBidiStreamHandler[Req, Res any](
 
 // ServeHTTP implements [http.Handler].
 func (h *Handler) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
+	requestContext := Context{
+		Spec: h.spec,
+	}
+	request = request.WithContext(context.WithValue(request.Context(), ContextKey{}, requestContext))
 	h.handler.ServeHTTP(responseWriter, request)
 }
 
