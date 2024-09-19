@@ -28,6 +28,8 @@ import (
 	v1 "connectrpc.com/connect/internal/gen/connect/ping/v1"
 	context "context"
 	errors "errors"
+	anypb "google.golang.org/protobuf/types/known/anypb"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 	http "net/http"
 	strings "strings"
 )
@@ -62,6 +64,8 @@ const (
 	PingServiceCountUpProcedure = "/connect.ping.v1.PingService/CountUp"
 	// PingServiceCumSumProcedure is the fully-qualified name of the PingService's CumSum RPC.
 	PingServiceCumSumProcedure = "/connect.ping.v1.PingService/CumSum"
+	// PingServiceAnyPingProcedure is the fully-qualified name of the PingService's AnyPing RPC.
+	PingServiceAnyPingProcedure = "/connect.ping.v1.PingService/AnyPing"
 )
 
 // These variables are the protoreflect.Descriptor objects for the RPCs defined in this package.
@@ -72,6 +76,7 @@ var (
 	pingServiceSumMethodDescriptor     = pingServiceServiceDescriptor.Methods().ByName("Sum")
 	pingServiceCountUpMethodDescriptor = pingServiceServiceDescriptor.Methods().ByName("CountUp")
 	pingServiceCumSumMethodDescriptor  = pingServiceServiceDescriptor.Methods().ByName("CumSum")
+	pingServiceAnyPingMethodDescriptor = pingServiceServiceDescriptor.Methods().ByName("AnyPing")
 )
 
 // PingServiceClient is a client for the connect.ping.v1.PingService service.
@@ -86,6 +91,7 @@ type PingServiceClient interface {
 	CountUp(context.Context, *connect.Request[v1.CountUpRequest]) (*connect.ServerStreamForClient[v1.CountUpResponse], error)
 	// CumSum determines the cumulative sum of all the numbers sent on the stream.
 	CumSum(context.Context) *connect.BidiStreamForClient[v1.CumSumRequest, v1.CumSumResponse]
+	AnyPing(context.Context, *connect.Request[emptypb.Empty]) (*connect.Response[anypb.Any], error)
 }
 
 // NewPingServiceClient constructs a client for the connect.ping.v1.PingService service. By default,
@@ -129,6 +135,12 @@ func NewPingServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			connect.WithSchema(pingServiceCumSumMethodDescriptor),
 			connect.WithClientOptions(opts...),
 		),
+		anyPing: connect.NewClient[emptypb.Empty, anypb.Any](
+			httpClient,
+			baseURL+PingServiceAnyPingProcedure,
+			connect.WithSchema(pingServiceAnyPingMethodDescriptor),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -139,6 +151,7 @@ type pingServiceClient struct {
 	sum     *connect.Client[v1.SumRequest, v1.SumResponse]
 	countUp *connect.Client[v1.CountUpRequest, v1.CountUpResponse]
 	cumSum  *connect.Client[v1.CumSumRequest, v1.CumSumResponse]
+	anyPing *connect.Client[emptypb.Empty, anypb.Any]
 }
 
 // Ping calls connect.ping.v1.PingService.Ping.
@@ -166,6 +179,11 @@ func (c *pingServiceClient) CumSum(ctx context.Context) *connect.BidiStreamForCl
 	return c.cumSum.CallBidiStream(ctx)
 }
 
+// AnyPing calls connect.ping.v1.PingService.AnyPing.
+func (c *pingServiceClient) AnyPing(ctx context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[anypb.Any], error) {
+	return c.anyPing.CallUnary(ctx, req)
+}
+
 // PingServiceHandler is an implementation of the connect.ping.v1.PingService service.
 type PingServiceHandler interface {
 	// Ping sends a ping to the server to determine if it's reachable.
@@ -178,6 +196,7 @@ type PingServiceHandler interface {
 	CountUp(context.Context, *connect.Request[v1.CountUpRequest], *connect.ServerStream[v1.CountUpResponse]) error
 	// CumSum determines the cumulative sum of all the numbers sent on the stream.
 	CumSum(context.Context, *connect.BidiStream[v1.CumSumRequest, v1.CumSumResponse]) error
+	AnyPing(context.Context, *connect.Request[emptypb.Empty]) (*connect.Response[anypb.Any], error)
 }
 
 // NewPingServiceHandler builds an HTTP handler from the service implementation. It returns the path
@@ -217,6 +236,12 @@ func NewPingServiceHandler(svc PingServiceHandler, opts ...connect.HandlerOption
 		connect.WithSchema(pingServiceCumSumMethodDescriptor),
 		connect.WithHandlerOptions(opts...),
 	)
+	pingServiceAnyPingHandler := connect.NewUnaryHandler(
+		PingServiceAnyPingProcedure,
+		svc.AnyPing,
+		connect.WithSchema(pingServiceAnyPingMethodDescriptor),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/connect.ping.v1.PingService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case PingServicePingProcedure:
@@ -229,6 +254,8 @@ func NewPingServiceHandler(svc PingServiceHandler, opts ...connect.HandlerOption
 			pingServiceCountUpHandler.ServeHTTP(w, r)
 		case PingServiceCumSumProcedure:
 			pingServiceCumSumHandler.ServeHTTP(w, r)
+		case PingServiceAnyPingProcedure:
+			pingServiceAnyPingHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -256,4 +283,8 @@ func (UnimplementedPingServiceHandler) CountUp(context.Context, *connect.Request
 
 func (UnimplementedPingServiceHandler) CumSum(context.Context, *connect.BidiStream[v1.CumSumRequest, v1.CumSumResponse]) error {
 	return connect.NewError(connect.CodeUnimplemented, errors.New("connect.ping.v1.PingService.CumSum is not implemented"))
+}
+
+func (UnimplementedPingServiceHandler) AnyPing(context.Context, *connect.Request[emptypb.Empty]) (*connect.Response[anypb.Any], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("connect.ping.v1.PingService.AnyPing is not implemented"))
 }
